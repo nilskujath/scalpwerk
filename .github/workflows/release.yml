@@ -48,11 +48,14 @@ jobs:
       - name: Install Poetry
         run: pip install poetry
 
+      - name: Install semantic-release
+        run: pip install python-semantic-release
+
       - name: Semantic Release
         id: release
-        uses: python-semantic-release/python-semantic-release@v9
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+        run: semantic-release version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish to PyPI
         if: steps.release.outputs.released == 'true'
