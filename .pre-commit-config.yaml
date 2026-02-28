@@ -1,0 +1,42 @@
+fail_fast: true
+repos:
+  - repo: local
+    hooks:
+      - id: black
+        name: Black
+        entry: poetry run black
+        language: system
+        types: [python]
+
+      - id: ruff-check
+        name: Ruff check
+        entry: poetry run ruff check --fix
+        language: system
+        types: [python]
+
+      - id: mypy
+        name: Mypy
+        entry: poetry run mypy src/scalpwerk
+        language: system
+        types: [python]
+        pass_filenames: false
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.2.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: debug-statements
+      - id: check-merge-conflict
