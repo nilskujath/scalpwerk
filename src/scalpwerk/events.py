@@ -27,12 +27,9 @@ class MarketUpdate:
 class BrokerRequest:
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class BrokerRequestBase(EventBase):
+    class SubmitOrder(EventBase):
         internal_order_id: uuid.UUID
         symbol: str
-
-    @dataclass(kw_only=True, frozen=True, slots=True)
-    class SubmitOrder(BrokerRequestBase):
         order_type: OrderType
         side: TradeSide
         quantity: float
@@ -40,51 +37,60 @@ class BrokerRequest:
         stop_price: int | None = None
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class ModifyOrder(BrokerRequestBase):
+    class ModifyOrder(EventBase):
+        internal_order_id: uuid.UUID
+        symbol: str
         quantity: float
         limit_price: int | None = None
         stop_price: int | None = None
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class CancelOrder(BrokerRequestBase):
-        pass
+    class CancelOrder(EventBase):
+        internal_order_id: uuid.UUID
+        symbol: str
 
 
 class BrokerResponse:
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class BrokerResponseBase(EventBase):
+    class CancellationAccepted(EventBase):
         internal_order_id: uuid.UUID
-        broker_order_id: str | int | None = None
+        broker_order_id: str | None = None
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class CancellationAccepted(BrokerResponseBase):
-        pass
-
-    @dataclass(kw_only=True, frozen=True, slots=True)
-    class CancellationRejected(BrokerResponseBase):
+    class CancellationRejected(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
         reason: str
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class ModificationAccepted(BrokerResponseBase):
-        pass
+    class ModificationAccepted(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class ModificationRejected(BrokerResponseBase):
+    class ModificationRejected(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
         reason: str
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class OrderAccepted(BrokerResponseBase):
-        pass
+    class OrderAccepted(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class OrderRejected(BrokerResponseBase):
+    class OrderRejected(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
         reason: str
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class Fill(BrokerResponseBase):
+    class Fill(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
         internal_fill_id: uuid.UUID
-        broker_fill_id: str | int | None = None
+        broker_fill_id: str | None = None
         side: TradeSide
         filled_quantity: float
         fill_price: int
@@ -92,5 +98,6 @@ class BrokerResponse:
         exchange: str = "SIMULATED"
 
     @dataclass(kw_only=True, frozen=True, slots=True)
-    class OrderExpired(BrokerResponseBase):
-        pass
+    class OrderExpired(EventBase):
+        internal_order_id: uuid.UUID
+        broker_order_id: str | None = None
