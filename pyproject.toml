@@ -1,0 +1,31 @@
+[project]
+name = "scalpwerk"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Nils P. Kujath",email = "63961429+NilsKujath@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+]
+
+[tool.poetry]
+packages = [{include = "scalpwerk", from = "src"}]
+
+
+[tool.poetry.group.dev.dependencies]
+black = "^26.1.0"
+pre-commit = "^4.5.1"
+python-semantic-release = "^10.5.3"
+ruff = "^0.15.4"
+mypy = "^1.19.1"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+branch = "master"
+build_command = "poetry build"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
