@@ -1,6 +1,6 @@
 [project]
 name = "scalpwerk"
-version = "0.1.0"
+version = "1.0.0"
 description = ""
 authors = [
     {name = "Nils P. Kujath",email = "63961429+NilsKujath@users.noreply.github.com"}
