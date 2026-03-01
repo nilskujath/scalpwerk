@@ -27,9 +27,9 @@ class EventBase:
 # can see exactly which methods the EventBus depends on without having to
 # read through the full Subscriber class.
 class SubscriberLike(typing.Protocol):
+    def wait_until_idle(self) -> None: ...
     @property
     def is_idle(self) -> bool: ...
-    def wait_until_idle(self) -> None: ...
     def receive(self, event: EventBase) -> None: ...
 
 
@@ -94,6 +94,7 @@ class EventBus:
                 subscribers = set().union(*self._per_event_subscriptions.values())
             for subscriber in subscribers:
                 subscriber.wait_until_idle()
+
             with self._lock:
                 subscribers = set().union(*self._per_event_subscriptions.values())
             if all(subscriber.is_idle for subscriber in subscribers):
@@ -102,8 +103,20 @@ class EventBus:
 
 class Subscriber(ABC):
     def __init__(self, event_bus: EventBus) -> None:
+        # The `EventBus` is injected rather than used as a hard-coded global instance so
+        # that in principle, multiple independent systems could co-exist within the same
+        # runtime.
         self._event_bus: EventBus = event_bus
+
+        # `None` in the type union acts as a poison pill: when the event loop receives
+        # `None`, it knows to shut down. See `shutdown` and `_event_loop` methods.
         self._queue: Queue[EventBase | None] = Queue()
+
+        # `threading.Event` is used instead of e.g. a boolean flag because it is
+        # thread-safe and can be checked from any other thread without needing a Lock.
+        # We set it before starting the thread so that `receive` can accept events from
+        # the moment the thread is alive. Otherwise, the `_running` check in `receive`
+        # would fail and events would be silently dropped.
         self._running: threading.Event = threading.Event()
         self._running.set()
         self._thread = threading.Thread(
@@ -111,14 +124,21 @@ class Subscriber(ABC):
         )
         self._thread.start()
 
-    @property
-    def is_idle(self) -> bool:
-        return self._queue.unfinished_tasks == 0
-
     def wait_until_idle(self) -> None:
+        # After shutdown, the event loop thread has exited and no longer calls
+        # `task_done()`. If an event was placed on the queue right before shutdown,
+        # `join()` would block forever waiting for it to be processed. Since a
+        # subscriber is idle per definition after shutdown, the method simply returns.
         if not self._running.is_set():
             return
         self._queue.join()
+
+    # The `wait_until_idle` method blocks until the subscriber's queue is joined. This
+    # method is a non-blocking (we do not wait for the queue to be empty) check whether
+    # the queue is idle.
+    @property
+    def is_idle(self) -> bool:
+        return self._queue.unfinished_tasks == 0
 
     def receive(self, event: EventBase) -> None:
         if self._running.is_set():
@@ -128,8 +148,18 @@ class Subscriber(ABC):
         if not self._running.is_set():
             return
         self._event_bus.remove_subscriber(self)
+
+        # We clear `_running` before putting the poison pill on the queue so that
+        # `receive` stops accepting new events before the event loop exits.
+        # Otherwise, the event loop could process the poison pill and exit while
+        # `receive` is still queuing events that would never be processed.
         self._running.clear()
         self._queue.put(None)
+
+        # A subscriber's `_on_event` handler might call `shutdown()` on itself, in which
+        # case we are already inside the subscriber's thread. Calling `join()` on the
+        # current thread would deadlock because a thread cannot join itself. This is an
+        # explicit guard against such implementation errors.
         if threading.current_thread() is not self._thread:
             self._thread.join()
 
@@ -140,9 +170,20 @@ class Subscriber(ABC):
     def _event_loop(self):
         while True:
             event = self._queue.get()
+
             if event is None:
+                # We still need to call `task_done()` for the poison pill itself,
+                # otherwise `wait_until_idle` would block forever on `queue.join()`
+                # waiting for this unfinished task.
                 self._queue.task_done()
                 break
+
+            # Subscribers are expected to handle their own exceptions within
+            # `_on_event`. This try/except is a last safety net so that an unhandled
+            # exception does not crash the subscriber's thread. The exception is
+            # delegated to `_on_exception` and the loop continues processing the next
+            # event. `task_done()` is in `finally` so the queue's unfinished task count
+            # stays correct even when the handler raises.
             try:
                 self._on_event(event)
             except Exception as exc:
