@@ -2,13 +2,8 @@ import uuid
 
 from dataclasses import dataclass
 
+from .messaging import EventBase
 from .models import OrderType, TradeSide
-
-
-@dataclass(kw_only=True, frozen=True, slots=True)
-class EventBase:
-    occurred_at_ns: int
-    created_at_ns: int
 
 
 class MarketUpdate:
