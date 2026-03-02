@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-03-02)
+
+### Chores
+
+- Add .claude/ to gitignore
+  ([`4b139a7`](https://github.com/nilskujath/scalpwerk/commit/4b139a7fd6f4b58bcb3489ce797f1715274b8a23))
+
+### Features
+
+- Add BrokerBase component with generic emittable event types
+  ([`0566f00`](https://github.com/nilskujath/scalpwerk/commit/0566f00145666332cc5f2caafee06482eace4fc3))
+
+### Refactoring
+
+- Consolidate models, events, and messaging into core module
+  ([`9a943ee`](https://github.com/nilskujath/scalpwerk/commit/9a943ee7e4ae4c36fc3cacecfec570c5ab57e5ba))
+
+
 ## v1.1.0 (2026-03-01)
 
 ### Documentation
