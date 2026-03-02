@@ -183,8 +183,9 @@ class Events:
 
 
 # The SubscriberLike protocol explicitly documents which methods the EventBus requires
-# from its subscribers. This is necessary because EventBus is defined before Subscriber,
-# so it cannot reference Subscriber directly in its type annotations.
+# from its subscribers. This is necessary because EventBus is defined before the
+# subscriber base class is defined, so it cannot reference Subscriberbase directly in
+# its type annotations.
 #
 # While `from __future__ import annotations` would also solve the forward reference,
 # the protocol makes the contract immediately visible and a reader can see exactly which
@@ -237,9 +238,11 @@ class EventBus:
         # of market data as soon as the current piece of market data has been completely
         # processed by the system. This is the case when every item that has been put
         # into any of subscribers' internal queue is marked as done via `task_done()`.
+        #
         # However, calling each subscriber's `wait_until_idle()` method just once is not
         # sufficient because a subscriber processing its events can publish new events
         # into queues of those subscribers that we have already checked for idleness.
+        #
         # This is why after waiting for all subscribers' queues to drain, we need to
         # take a fresh snapshot to verify that every subscriber is still idle.
         # If any subscriber should have become active again, we repeat the process until
@@ -249,6 +252,7 @@ class EventBus:
             # actual waiting outside of it because a subscriber processing its events
             # may publish new events via `publish_event_to_system`, which also needs
             # the Lock.
+            #
             # Holding the Lock while waiting would deadlock: the subscriber
             # can't finish processing because it's blocked trying to publish, and we
             # can't stop waiting because the subscriber isn't done.
@@ -266,11 +270,22 @@ class EventBus:
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
-# SYSTEM COMPONENT DEFINITIONS
+# DEFINITION OF BASE CLASS FOR ALL SYSTEM COMPONENTS
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-class Subscriber(ABC):
+# Each system component can only emit a specific subset of event types. This TypeVar
+# is used to parameterize `SubscriberBase` so that subclasses specify which event types
+# they are allowed to emit via `_emit_event`. This way the type checker enforces the
+# restriction without needing to override the method, which would violate the Liskov
+# substitution principle.
+EmittableEventType = typing.TypeVar("EmittableEventType", bound=EventBase)
+
+
+# `typing.Generic[EmittableEventType]` makes this class parameterizable so that
+# subclasses can specify which event types they are allowed to emit by writing e.g.
+# `class BrokerBase(SubscriberBase[SomeBrokerResponseType])`.
+class SubscriberBase(ABC, typing.Generic[EmittableEventType]):
     def __init__(self, event_bus: EventBus) -> None:
         # The `EventBus` is injected rather than used as a hard-coded global instance so
         # that in principle, multiple independent systems could co-exist within the same
@@ -365,4 +380,67 @@ class Subscriber(ABC):
         pass
 
     def _on_exception(self, exception: Exception):
+        pass
+
+    # `EmittableEventType` is generic here but gets narrowed to a specific set of event
+    # types when a subclass specifies them via `SubscriberBase[...]` in its class
+    # definition. Together with `_subscribe_to_events` in `__init__`, this makes the
+    # contract of each component explicit: which events it receives and which events
+    # it produces.
+    def _emit_event(self, event: EmittableEventType) -> None:
+        self._event_bus.publish_event_to_system(event)
+
+
+# ——————————————————————————————————————————————————————————————————————————————————————
+# BROKER BASE CLASS DEFINITION
+# ——————————————————————————————————————————————————————————————————————————————————————
+
+
+# The `SubscriberBase[...]` construction specifies which event types a broker is allowed
+# to emit via `_emit_event`. See the `EmittableEventType` TypeVar above for details.
+class BrokerBase(
+    SubscriberBase[
+        Events.BrokerResponse.OrderAccepted
+        | Events.BrokerResponse.OrderRejected
+        | Events.BrokerResponse.ModificationAccepted
+        | Events.BrokerResponse.ModificationRejected
+        | Events.BrokerResponse.CancellationAccepted
+        | Events.BrokerResponse.CancellationRejected
+        | Events.BrokerResponse.Fill
+        | Events.BrokerResponse.OrderExpired
+    ]
+):
+    def __init__(self, event_bus: EventBus):
+        super().__init__(event_bus)
+
+        self._subscribe_to_events(
+            Events.BrokerRequest.SubmitOrder,
+            Events.BrokerRequest.ModifyOrder,
+            Events.BrokerRequest.CancelOrder,
+        )
+
+    def _on_event(self, event: EventBase) -> None:
+        # The parentheses in `SubmitOrder()` et cetera are required by Python's pattern
+        # matching. Without them, the name would be treated as a capture pattern that
+        # matches any value instead of checking the class.
+        match event:
+            case Events.BrokerRequest.SubmitOrder() as submit_order_event:
+                self._on_submit_order(submit_order_event)
+            case Events.BrokerRequest.ModifyOrder() as modify_order_event:
+                self._on_modify_order(modify_order_event)
+            case Events.BrokerRequest.CancelOrder() as cancel_order_event:
+                self._on_cancel_order(cancel_order_event)
+            case _:
+                return
+
+    @abstractmethod
+    def _on_submit_order(self, event: Events.BrokerRequest.SubmitOrder) -> None:
+        pass
+
+    @abstractmethod
+    def _on_modify_order(self, event: Events.BrokerRequest.ModifyOrder) -> None:
+        pass
+
+    @abstractmethod
+    def _on_cancel_order(self, event: Events.BrokerRequest.CancelOrder) -> None:
         pass
