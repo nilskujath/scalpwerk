@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-03-02)
+
+### Documentation
+
+- Mention domain models in file structure comment
+  ([`dd6b693`](https://github.com/nilskujath/scalpwerk/commit/dd6b6934ef17d58458efaeedeb85f753fd93b7c5))
+
+### Features
+
+- Add ExternalComponentMixin for components that interface with external systems
+  ([`c1427bb`](https://github.com/nilskujath/scalpwerk/commit/c1427bbed3136a4f10350c2c9b5a88c58d379cb9))
+
+
 ## v1.2.0 (2026-03-02)
 
 ### Chores
