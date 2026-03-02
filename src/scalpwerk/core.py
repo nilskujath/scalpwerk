@@ -21,11 +21,12 @@ from enum import Enum, auto
 # send events (as event messages) to the event bus, which then notifies the relevant
 # system components.
 #
-# This file contains the core of this system by first defining the set of events the
-# system recognizes, then defining the event bus, and then defining the components. The
-# components are defined as base classes that define which event types a certain
-# component needs to handle and which events it needs to emit in response to them.
-# Concrete implementations of these components are then made outside this core module.
+# This file contains the core of this system by first defining domain models, then
+# defining the set of events the system recognizes, then defining the event bus, and
+# then defining the components. The components are defined as base classes that define
+# which event types a certain component needs to handle and which events it needs to
+# emit in response to them. Concrete implementations of these components are then made
+# outside this core module.
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -270,7 +271,7 @@ class EventBus:
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
-# DEFINITION OF BASE CLASS FOR ALL SYSTEM COMPONENTS
+# COMPONENT BASE CLASS DEFINITIONS
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
