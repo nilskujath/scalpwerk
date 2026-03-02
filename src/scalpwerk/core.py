@@ -391,6 +391,18 @@ class SubscriberBase(ABC, typing.Generic[EmittableEventType]):
         self._event_bus.publish_event_to_system(event)
 
 
+# Components that interface with external systems (e.g. a broker or a data feed) need to
+# have methods for connecting and disconnecting from external APIs.
+class ExternalComponentMixin(ABC):
+    @abstractmethod
+    def connect(self) -> None:
+        pass
+
+    @abstractmethod
+    def disconnect(self) -> None:
+        pass
+
+
 # ——————————————————————————————————————————————————————————————————————————————————————
 # BROKER BASE CLASS DEFINITION
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -399,6 +411,7 @@ class SubscriberBase(ABC, typing.Generic[EmittableEventType]):
 # The `SubscriberBase[...]` construction specifies which event types a broker is allowed
 # to emit via `_emit_event`. See the `EmittableEventType` TypeVar above for details.
 class BrokerBase(
+    ExternalComponentMixin,
     SubscriberBase[
         Events.BrokerResponse.OrderAccepted
         | Events.BrokerResponse.OrderRejected
@@ -408,7 +421,7 @@ class BrokerBase(
         | Events.BrokerResponse.CancellationRejected
         | Events.BrokerResponse.Fill
         | Events.BrokerResponse.OrderExpired
-    ]
+    ],
 ):
     def __init__(self, event_bus: EventBus):
         super().__init__(event_bus)
