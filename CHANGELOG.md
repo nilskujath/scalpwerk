@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-03-03)
+
+### Features
+
+- Add DatafeedBase component with subscribe/unsubscribe interface
+  ([`af159f0`](https://github.com/nilskujath/scalpwerk/commit/af159f037dd53fd94c0ccb3ddb4082fb483dd25c))
+
+### Refactoring
+
+- Split SubscriberBase into ComponentBase, SubscriberBase, and EmitterBase
+  ([`bfee4c6`](https://github.com/nilskujath/scalpwerk/commit/bfee4c63e3694d5a8346613f50ae3c3827750e65))
+
+
 ## v1.3.0 (2026-03-02)
 
 ### Documentation
