@@ -271,30 +271,44 @@ class EventBus:
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
-# COMPONENT BASE CLASS DEFINITIONS
+# GENERAL SYSTEM COMPONENT BASE CLASS DEFINITIONS
 # ——————————————————————————————————————————————————————————————————————————————————————
 
+# System components have two fundamental roles: receiving events (subscribing) and
+# producing events (emitting). These roles are cleanly separated into `SubscriberBase`
+# and `EmitterBase`. Some components only emit (e.g. a data feed), while others both
+# subscribe and emit (e.g. a broker).
+#
+# For structural coherence, and so that both base classes share a single event bus
+# reference, they inherit from a common `ComponentBase`. This creates a diamond-like
+# inheritance for concrete component base classes that are both emitters and subscribers
+# (e.g. `BrokerBase`).
+#
+#                ComponentBase
+#                 /         \
+#        SubscriberBase   EmitterBase
+#                 \         /    |
+#                BrokerBase  DatafeedBase
+#
+# Additionally, components that interface with external systems (e.g. a broker or data
+# feed) use `ExternalComponentMixin` for their connection lifecycle.
 
-# Each system component can only emit a specific subset of event types. This TypeVar
-# is used to parameterize `SubscriberBase` so that subclasses specify which event types
-# they are allowed to emit via `_emit_event`. This way the type checker enforces the
-# restriction without needing to override the method, which would violate the Liskov
-# substitution principle.
-EmittableEventType = typing.TypeVar("EmittableEventType", bound=EventBase)
 
-
-# `typing.Generic[EmittableEventType]` makes this class parameterizable so that
-# subclasses can specify which event types they are allowed to emit by writing e.g.
-# `class BrokerBase(SubscriberBase[SomeBrokerResponseType])`.
-class SubscriberBase(ABC, typing.Generic[EmittableEventType]):
+class ComponentBase(ABC):
     def __init__(self, event_bus: EventBus) -> None:
-        # The `EventBus` is injected rather than used as a hard-coded global instance so
-        # that in principle, multiple independent systems could co-exist within the same
-        # runtime.
+        # The concrete `EventBus` instance is injected rather than used as a hard-coded
+        # global instance so that in principle, multiple independent systems could
+        # co-exist within the same runtime, should this behavior be needed.
         self._event_bus: EventBus = event_bus
 
+
+class SubscriberBase(ComponentBase):
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__(event_bus)
+
         # `None` in the type union acts as a poison pill: when the event loop receives
-        # `None`, it knows to shut down. See `shutdown` and `_event_loop` methods.
+        # `None`, it knows to shut down. See `shutdown` and `_event_loop` methods for
+        # how this is implemented.
         self._queue: Queue[EventBase | None] = Queue()
 
         # `threading.Event` is used instead of e.g. a boolean flag because it is
@@ -383,11 +397,22 @@ class SubscriberBase(ABC, typing.Generic[EmittableEventType]):
     def _on_exception(self, exception: Exception):
         pass
 
+
+# Each system component can only emit a specific subset of event types. This TypeVar
+# is used to parameterize `EmitterBase` so that subclasses specify which event types
+# they are allowed to emit via `_emit_event`. This way the type checker enforces the
+# restriction without needing to override the method, which would violate the Liskov
+# substitution principle.
+EmittableEventType = typing.TypeVar("EmittableEventType", bound=EventBase)
+
+
+# `typing.Generic[EmittableEventType]` makes this class parameterizable so that
+# subclasses can specify which event types they are allowed to emit by writing e.g.
+# `class DatafeedBase(EmitterBase[SomeMarketUpdateType])`.
+class EmitterBase(ComponentBase, typing.Generic[EmittableEventType]):
     # `EmittableEventType` is generic here but gets narrowed to a specific set of event
-    # types when a subclass specifies them via `SubscriberBase[...]` in its class
-    # definition. Together with `_subscribe_to_events` in `__init__`, this makes the
-    # contract of each component explicit: which events it receives and which events
-    # it produces.
+    # types when a subclass specifies them via `EmitterBase[...]` in its class
+    # definition.
     def _emit_event(self, event: EmittableEventType) -> None:
         self._event_bus.publish_event_to_system(event)
 
@@ -405,15 +430,16 @@ class ExternalComponentMixin(ABC):
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
-# BROKER BASE CLASS DEFINITION
+# CONCRETE BASE CLASS DEFINITIONS
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-# The `SubscriberBase[...]` construction specifies which event types a broker is allowed
+# The `EmitterBase[...]` construction specifies which event types a broker is allowed
 # to emit via `_emit_event`. See the `EmittableEventType` TypeVar above for details.
 class BrokerBase(
     ExternalComponentMixin,
-    SubscriberBase[
+    SubscriberBase,
+    EmitterBase[
         Events.BrokerResponse.OrderAccepted
         | Events.BrokerResponse.OrderRejected
         | Events.BrokerResponse.ModificationAccepted
