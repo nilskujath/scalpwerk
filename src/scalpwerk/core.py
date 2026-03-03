@@ -74,6 +74,8 @@ class EventBase:
 
 
 class Events:
+    # When new market event types are added here (e.g. MBO), the `EmitterBase[...]` type
+    # parameter in `DatafeedBase` must be extended to include them.
     class MarketUpdate:
         @dataclass(kw_only=True, frozen=True, slots=True)
         class OHLCV(EventBase):
@@ -483,4 +485,19 @@ class BrokerBase(
 
     @abstractmethod
     def _on_cancel_order(self, event: Events.BrokerRequest.CancelOrder) -> None:
+        pass
+
+
+# The emittable type is currently restricted to OHLCV. When new market event types are
+# added to `Events.MarketUpdate`, they must be added to this union as well.
+class DatafeedBase(ExternalComponentMixin, EmitterBase[Events.MarketUpdate.OHLCV]):
+    def __init__(self, event_bus: EventBus):
+        super().__init__(event_bus)
+
+    @abstractmethod
+    def subscribe(self, symbols: list[str], record_type: Models.RecordType) -> None:
+        pass
+
+    @abstractmethod
+    def unsubscribe(self, symbols: list[str], record_type: Models.RecordType) -> None:
         pass
