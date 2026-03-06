@@ -3,30 +3,33 @@ import typing
 import uuid
 
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from enum import Enum, auto
 from queue import Queue
 
-from enum import Enum, auto
+# ——————————————————————————————————————————————————————————————————————————————————————
+# DOMAIN-SPECIFIC TYPE DEFINITIONS
+# ——————————————————————————————————————————————————————————————————————————————————————
 
-# Our system models its domain through a set of events that occur in it. This defines
-# the scope of our system, since every event needs to have a proper reaction somewhere
-# in the system.
-#
-# A component in our system is an entity that reacts to an event, which might result in
-# another event that the system needs to react to. We made the decision to fully
-# decouple system components from each other by introducing an event bus that allows
-# system components to subscribe themselves to certain types of events that they want
-# to receive. For this reason, system components do not communicate with each other, but
-# send events (as event messages) to the event bus, which then notifies the relevant
-# system components.
-#
-# This file contains the core of this system by first defining domain models, then
-# defining the set of events the system recognizes, then defining the event bus, and
-# then defining the components. The components are defined as base classes that define
-# which event types a certain component needs to handle and which events it needs to
-# emit in response to them. Concrete implementations of these components are then made
-# outside this core module.
+
+UnixNanoseconds = typing.NewType("UnixNanoseconds", int)
+
+ScaledPrice = typing.NewType("ScaledPrice", int)
+IndicatorValue = typing.NewType("IndicatorValue", float)
+
+Volume = typing.NewType("Volume", int)
+Quantity = typing.NewType("Quantity", int)
+FilledQuantity = typing.NewType("FilledQuantity", int)
+PositionSize = typing.NewType("PositionSize", int)
+
+Symbol = typing.NewType("Symbol", str)
+IndicatorName = typing.NewType("IndicatorName", str)
+
+InternalOrderId = typing.NewType("InternalOrderId", uuid.UUID)
+InternalFillId = typing.NewType("InternalFillId", uuid.UUID)
+BrokerOrderId = typing.NewType("BrokerOrderId", str)
+BrokerFillId = typing.NewType("BrokerFillId", str)
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -34,22 +37,18 @@ from enum import Enum, auto
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-# Domain models represent concepts that have a fixed, known set of members.
 class Models:
     class OrderType(Enum):
         MARKET = auto()
+        LIMIT = auto()
+        STOP = auto()
+        STOP_LIMIT = auto()
 
     class TradeSide(Enum):
         BUY = auto()
         SELL = auto()
 
-    # The values for record types are not auto-generated but match DataBento's schema
-    # values for convenience (note that this does not create any dependencies towards
-    # DataBento's schemas).
-    #
-    # Only OHLCV record types are defined for now because the system is not yet
-    # designed to handle other record types like MBO (market by order) et cetera. These
-    # can be added here when the system is extended to support them.
+    # The enum values for record types match DataBento's schema values for convenience.
     class RecordType(Enum):
         OHLCV_1S = 32
         OHLCV_1M = 33
@@ -62,63 +61,56 @@ class Models:
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-# We need to define the base class for events outside the `Events` namespace because
-# nested classes in Python cannot reference their enclosing class by name. When the
-# nested event classes are being defined, the `Events` class body is still being
-# executed and the name `Events` does not exist yet, so inheriting from
-# `Events.EventBase` (if we defined it there) would raise a `NameError`.
+# Defined outside `Events` so nested classes within `Events` can inherit from it.
 @dataclass(kw_only=True, frozen=True, slots=True)
 class EventBase:
-    occurred_at_ns: int
-    created_at_ns: int
+    occurred_at_ns: UnixNanoseconds
+    created_at_ns: UnixNanoseconds
 
 
 class Events:
-    # When new market event types are added here (e.g. MBO), the `EmitterBase[...]` type
-    # parameter in `DatafeedBase` must be extended to include them.
     class MarketUpdate:
         @dataclass(kw_only=True, frozen=True, slots=True)
         class OHLCV(EventBase):
-            symbol: str
-            # `typing.Literal` restricts the record type to the OHLCV members
-            # specifically, so that when other record types are added to
-            # `Models.RecordType` in the future, they cannot accidentally be used with
-            # this event that is only supposed to carry aggregated OHLCV bars.
+            symbol: Symbol
             record_type: typing.Literal[
                 Models.RecordType.OHLCV_1S,
                 Models.RecordType.OHLCV_1M,
                 Models.RecordType.OHLCV_1H,
                 Models.RecordType.OHLCV_1D,
             ]
-            open: int
-            high: int
-            low: int
-            close: int
-            volume: int | None = None
+            open: ScaledPrice
+            high: ScaledPrice
+            low: ScaledPrice
+            close: ScaledPrice
+            volume: Volume | None = None
+
+    class StrategyUpdate:
+        @dataclass(kw_only=True, frozen=True, slots=True)
+        class IndicatorUpdate(EventBase):
+            symbol: Symbol
+            source_event: "Events.MarketUpdate.OHLCV"
+            indicator_values: dict[IndicatorName, IndicatorValue]
 
     class BrokerRequest:
         @dataclass(kw_only=True, frozen=True, slots=True)
         class _RequestBase(EventBase):
-            # The internal order ID is generated by the system before sending a request
-            # to the broker. It allows us to track an order through its entire lifecycle
-            # independently of whatever ID the broker assigns and keep things consistent
-            # between simulated broker and live broker components.
-            internal_order_id: uuid.UUID
-            symbol: str
+            internal_order_id: InternalOrderId
+            symbol: Symbol
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class SubmitOrder(_RequestBase):
             order_type: Models.OrderType
             side: Models.TradeSide
-            quantity: int
-            limit_price: int | None = None
-            stop_price: int | None = None
+            quantity: Quantity
+            limit_price: ScaledPrice | None = None
+            stop_price: ScaledPrice | None = None
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class ModifyOrder(_RequestBase):
-            quantity: int
-            limit_price: int | None = None
-            stop_price: int | None = None
+            quantity: Quantity
+            limit_price: ScaledPrice | None = None
+            stop_price: ScaledPrice | None = None
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class CancelOrder(_RequestBase):
@@ -127,12 +119,10 @@ class Events:
     class BrokerResponse:
         @dataclass(kw_only=True, frozen=True, slots=True)
         class _ResponseBase(EventBase):
-            internal_order_id: uuid.UUID
-            # The broker order ID is carried through the system so that fills and other
-            # responses can be reconciled against broker statements. It is optional
-            # because some responses (e.g. rejection of a new order) may arrive before
-            # the broker has assigned an ID.
-            broker_order_id: str | None = None
+            internal_order_id: InternalOrderId
+            # Carried for reconciliation against broker statements. Optional because a
+            # rejection may arrive before the broker has assigned an ID.
+            broker_order_id: BrokerOrderId | None = None
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class CancellationAccepted(_ResponseBase):
@@ -140,8 +130,7 @@ class Events:
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class CancellationRejected(_ResponseBase):
-            # Free-form rejection reason as provided by the broker for manual
-            # inspection.
+            # Free-form rejection reason as provided by the broker for manual review.
             reason: str
 
         @dataclass(kw_only=True, frozen=True, slots=True)
@@ -160,20 +149,19 @@ class Events:
         class OrderRejected(_ResponseBase):
             reason: str
 
-        # A fill represents a single execution against an order. It does not indicate
-        # whether the order is partially or fully filled. The system must track fill
-        # quantities internally to determine the remaining open quantity on an order.
+        # A single execution against an order. Does not indicate partial vs. full fill;
+        # the system must track fill quantities to determine remaining open quantity.
         @dataclass(kw_only=True, frozen=True, slots=True)
         class Fill(_ResponseBase):
-            internal_fill_id: uuid.UUID
-            broker_fill_id: str | None = None
+            symbol: Symbol
+            internal_fill_id: InternalFillId
+            broker_fill_id: BrokerFillId | None = None
             side: Models.TradeSide
-            filled_quantity: int
-            fill_price: int
+            filled_quantity: Quantity
+            fill_price: ScaledPrice
             exchange: str
-            # Commission covers all costs associated with this fill (broker fees,
-            # exchange fees, regulatory fees, etc.) as a single value.
-            commission: int | None = None
+            # Combined cost for this fill (broker, exchange, and regulatory fees).
+            commission: ScaledPrice | None = None
 
         @dataclass(kw_only=True, frozen=True, slots=True)
         class OrderExpired(_ResponseBase):
@@ -185,15 +173,8 @@ class Events:
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-# The SubscriberLike protocol explicitly documents which methods the EventBus requires
-# from its subscribers. This is necessary because EventBus is defined before the
-# subscriber base class is defined, so it cannot reference Subscriberbase directly in
-# its type annotations.
-#
-# While `from __future__ import annotations` would also solve the forward reference,
-# the protocol makes the contract immediately visible and a reader can see exactly which
-# methods the EventBus depends on without having to read through the full Subscriber
-# class that is defined below the `EventBus` class.
+# Defines the subscriber interface that `EventBus` depends on. A protocol is used
+# because `SubscriberBase` is defined after `EventBus`.
 class SubscriberLike(typing.Protocol):
     def wait_until_idle(self) -> None: ...
     @property
@@ -208,10 +189,8 @@ class EventBus:
         self._per_event_subscriptions: defaultdict[
             type[EventBase], set[SubscriberLike]
         ] = defaultdict(set)
-
-        # Because each subscriber in `_per_event_subscriptions` runs in its own thread
-        # we need to ensure that `_per_event_subscriptions` can only be accessed from
-        # one subscriber thread at a time, for which we need a Lock.
+        # Each subscriber runs in its own thread. The Lock ensures that only one
+        # subscriber thread at a time can access `_per_event_subscriptions`.
         self._lock: threading.Lock = threading.Lock()
 
     def add_event_subscription(
@@ -226,42 +205,22 @@ class EventBus:
                 subscriber_set.discard(subscriber)
 
     def publish_event_to_system(self, event: EventBase) -> None:
-        # Since the `publish_event_to_system` method is accessed from within the
-        # subscriber threads concurrently, we want to minimize the time the Lock is
-        # held by each thread so publishing can be done as concurrently as possible
-        # between threads. This is why we only copy the set of subscribers for the
-        # event type within the Lock and do the rest outside the Lock.
+        # Copy under the Lock and iterate outside it so the Lock is held as briefly
+        # as possible and concurrent publishes from other threads are not blocked.
         with self._lock:
             subscribers = self._per_event_subscriptions[type(event)].copy()
         for subscriber in subscribers:
             subscriber.receive(event)
 
+    # Backtesting must wait for all subscribers to finish before feeding the next market
+    # event, otherwise the strategy and simulated broker would fall out of sync.
     def wait_until_system_idle(self) -> None:
-        # To run backtesting at the maximum possible speed, we want to feed a new piece
-        # of market data as soon as the current piece of market data has been completely
-        # processed by the system. This is the case when every item that has been put
-        # into any of subscribers' internal queue is marked as done via `task_done()`.
-        #
-        # However, calling each subscriber's `wait_until_idle()` method just once is not
-        # sufficient because a subscriber processing its events can publish new events
-        # into queues of those subscribers that we have already checked for idleness.
-        #
-        # This is why after waiting for all subscribers' queues to drain, we need to
-        # take a fresh snapshot to verify that every subscriber is still idle.
-        # If any subscriber should have become active again, we repeat the process until
-        # all of them are truly idle, which is why we need the `while True` loop.
+        # A single pass is insufficient because processing can publish new events into
+        # already-drained queues, so we loop until a re-check confirms idleness.
         while True:
-            # We only access `_per_event_subscriptions` within the Lock and do the
-            # actual waiting outside of it because a subscriber processing its events
-            # may publish new events via `publish_event_to_system`, which also needs
-            # the Lock.
-            #
-            # Holding the Lock while waiting would deadlock: the subscriber
-            # can't finish processing because it's blocked trying to publish, and we
-            # can't stop waiting because the subscriber isn't done.
+            # Waiting for the subscribers to be idle needs to be done outside the lock
+            # since they may require the lock themselves to publish an event.
             with self._lock:
-                # The `set().union(*)` deduplicates subscribers that appear under
-                # multiple event types so we don't wait on the same subscriber twice.
                 subscribers = set().union(*self._per_event_subscriptions.values())
             for subscriber in subscribers:
                 subscriber.wait_until_idle()
@@ -276,48 +235,21 @@ class EventBus:
 # GENERAL SYSTEM COMPONENT BASE CLASS DEFINITIONS
 # ——————————————————————————————————————————————————————————————————————————————————————
 
-# System components have two fundamental roles: receiving events (subscribing) and
-# producing events (emitting). These roles are cleanly separated into `SubscriberBase`
-# and `EmitterBase`. Some components only emit (e.g. a data feed), while others both
-# subscribe and emit (e.g. a broker).
-#
-# For structural coherence, and so that both base classes share a single event bus
-# reference, they inherit from a common `ComponentBase`. This creates a diamond-like
-# inheritance for concrete component base classes that are both emitters and subscribers
-# (e.g. `BrokerBase`).
-#
-#                ComponentBase
-#                 /         \
-#        SubscriberBase   EmitterBase
-#                 \         /    |
-#                BrokerBase  DatafeedBase
-#
-# Additionally, components that interface with external systems (e.g. a broker or data
-# feed) use `ExternalComponentMixin` for their connection lifecycle.
-
 
 class ComponentBase(ABC):
     def __init__(self, event_bus: EventBus) -> None:
-        # The concrete `EventBus` instance is injected rather than used as a hard-coded
-        # global instance so that in principle, multiple independent systems could
-        # co-exist within the same runtime, should this behavior be needed.
+        # The concrete `EventBus` instance is injected rather than a global instance so
+        # multiple independent systems could co-exist within the same runtime.
         self._event_bus: EventBus = event_bus
 
 
 class SubscriberBase(ComponentBase):
     def __init__(self, event_bus: EventBus) -> None:
         super().__init__(event_bus)
-
-        # `None` in the type union acts as a poison pill: when the event loop receives
-        # `None`, it knows to shut down. See `shutdown` and `_event_loop` methods for
-        # how this is implemented.
+        # None acts as a poison pill that tells the event loop to shut down.
         self._queue: Queue[EventBase | None] = Queue()
-
-        # `threading.Event` is used instead of e.g. a boolean flag because it is
-        # thread-safe and can be checked from any other thread without needing a Lock.
-        # We set it before starting the thread so that `receive` can accept events from
-        # the moment the thread is alive. Otherwise, the `_running` check in `receive`
-        # would fail and events would be silently dropped.
+        # Thread-safe flag (no Lock needed). Set before starting the thread so receive
+        # can accept events immediately; otherwise they'd be silently dropped.
         self._running: threading.Event = threading.Event()
         self._running.set()
         self._thread = threading.Thread(
@@ -326,19 +258,15 @@ class SubscriberBase(ComponentBase):
         self._thread.start()
 
     def wait_until_idle(self) -> None:
-        # After shutdown, the event loop thread has exited and no longer calls
-        # `task_done()`. If an event was placed on the queue right before shutdown,
-        # `join()` would block forever waiting for it to be processed. Since a
-        # subscriber is idle per definition after shutdown, the method simply returns.
         if not self._running.is_set():
             return
         self._queue.join()
 
-    # The `wait_until_idle` method blocks until the subscriber's queue is joined. This
-    # method is a non-blocking (we do not wait for the queue to be empty) check whether
-    # the queue is idle.
+    # Checks idleness without waiting for the queue to drain (i.e., non-blocking check).
     @property
     def is_idle(self) -> bool:
+        if not self._running.is_set():
+            return True
         return self._queue.unfinished_tasks == 0
 
     def receive(self, event: EventBase) -> None:
@@ -349,18 +277,11 @@ class SubscriberBase(ComponentBase):
         if not self._running.is_set():
             return
         self._event_bus.remove_subscriber(self)
-
-        # We clear `_running` before putting the poison pill on the queue so that
-        # `receive` stops accepting new events before the event loop exits.
-        # Otherwise, the event loop could process the poison pill and exit while
-        # `receive` is still queuing events that would never be processed.
+        # Clear `_running` before the poison pill so `receive` stops accepting events
         self._running.clear()
         self._queue.put(None)
-
-        # A subscriber's `_on_event` handler might call `shutdown()` on itself, in which
-        # case we are already inside the subscriber's thread. Calling `join()` on the
-        # current thread would deadlock because a thread cannot join itself. This is an
-        # explicit guard against such implementation errors.
+        # If `shutdown()` is called from within `_on_event`, we're on the subscriber's
+        # own thread. A thread cannot join itself, this prevents a runtime error.
         if threading.current_thread() is not self._thread:
             self._thread.join()
 
@@ -369,58 +290,46 @@ class SubscriberBase(ComponentBase):
             self._event_bus.add_event_subscription(self, event_type)
 
     def _event_loop(self):
-        while True:
-            event = self._queue.get()
-
-            if event is None:
-                # We still need to call `task_done()` for the poison pill itself,
-                # otherwise `wait_until_idle` would block forever on `queue.join()`
-                # waiting for this unfinished task.
-                self._queue.task_done()
-                break
-
-            # Subscribers are expected to handle their own exceptions within
-            # `_on_event`. This try/except is a last safety net so that an unhandled
-            # exception does not crash the subscriber's thread. The exception is
-            # delegated to `_on_exception` and the loop continues processing the next
-            # event. `task_done()` is in `finally` so the queue's unfinished task count
-            # stays correct even when the handler raises.
-            try:
-                self._on_event(event)
-            except Exception as exc:
-                self._on_exception(exc)
-            finally:
-                self._queue.task_done()
+        try:
+            while True:
+                event = self._queue.get()
+                if event is None:
+                    # `task_done()` needs to be called for the poison pill itself,
+                    # otherwise `queue.join()` would block indefinitely after shutdown.
+                    self._queue.task_done()
+                    break
+                # If `_on_exception` re-raises, the outer except clears `_running` so
+                # the system doesn't deadlock on a dead thread.
+                try:
+                    self._on_event(event)
+                except Exception as exc:
+                    self._on_exception(exc)
+                finally:
+                    self._queue.task_done()
+        except Exception:
+            self._running.clear()
 
     @abstractmethod
     def _on_event(self, event: EventBase):
         pass
 
+    @abstractmethod
     def _on_exception(self, exception: Exception):
         pass
 
 
-# Each system component can only emit a specific subset of event types. This TypeVar
-# is used to parameterize `EmitterBase` so that subclasses specify which event types
-# they are allowed to emit via `_emit_event`. This way the type checker enforces the
-# restriction without needing to override the method, which would violate the Liskov
-# substitution principle.
+# Parameterizes `EmitterBase` so each subclass must declare which event types it emits.
 EmittableEventType = typing.TypeVar("EmittableEventType", bound=EventBase)
 
 
-# `typing.Generic[EmittableEventType]` makes this class parameterizable so that
-# subclasses can specify which event types they are allowed to emit by writing e.g.
-# `class DatafeedBase(EmitterBase[SomeMarketUpdateType])`.
+# Subclasses specify their allowed event types, e.g.
+# `class DatafeedBase(EmitterBase[<Events.<NestedNamespace>.SomeEventType>])`.
 class EmitterBase(ComponentBase, typing.Generic[EmittableEventType]):
-    # `EmittableEventType` is generic here but gets narrowed to a specific set of event
-    # types when a subclass specifies them via `EmitterBase[...]` in its class
-    # definition.
     def _emit_event(self, event: EmittableEventType) -> None:
         self._event_bus.publish_event_to_system(event)
 
 
-# Components that interface with external systems (e.g. a broker or a data feed) need to
-# have methods for connecting and disconnecting from external APIs.
+# Mixin class for components that needs to manage an external connection lifecycle.
 class ExternalComponentMixin(ABC):
     @abstractmethod
     def connect(self) -> None:
@@ -436,8 +345,6 @@ class ExternalComponentMixin(ABC):
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-# The `EmitterBase[...]` construction specifies which event types a broker is allowed
-# to emit via `_emit_event`. See the `EmittableEventType` TypeVar above for details.
 class BrokerBase(
     ExternalComponentMixin,
     SubscriberBase,
@@ -462,9 +369,6 @@ class BrokerBase(
         )
 
     def _on_event(self, event: EventBase) -> None:
-        # The parentheses in `SubmitOrder()` et cetera are required by Python's pattern
-        # matching. Without them, the name would be treated as a capture pattern that
-        # matches any value instead of checking the class.
         match event:
             case Events.BrokerRequest.SubmitOrder() as submit_order_event:
                 self._on_submit_order(submit_order_event)
@@ -488,16 +392,403 @@ class BrokerBase(
         pass
 
 
-# The emittable type is currently restricted to OHLCV. When new market event types are
-# added to `Events.MarketUpdate`, they must be added to this union as well.
 class DatafeedBase(ExternalComponentMixin, EmitterBase[Events.MarketUpdate.OHLCV]):
     def __init__(self, event_bus: EventBus):
         super().__init__(event_bus)
 
     @abstractmethod
-    def subscribe(self, symbols: list[str], record_type: Models.RecordType) -> None:
+    def subscribe(self, symbols: list[Symbol], record_type: Models.RecordType) -> None:
         pass
 
     @abstractmethod
-    def unsubscribe(self, symbols: list[str], record_type: Models.RecordType) -> None:
+    def unsubscribe(
+        self, symbols: list[Symbol], record_type: Models.RecordType
+    ) -> None:
         pass
+
+
+# Computes and stores a single scalar value per symbol on each `update` call. Complex
+# indicators must be split into separate instances, e.g. `BollingerUpper` et cetera.
+class IndicatorBase(ABC):
+    def __init__(self, max_history: int = 100) -> None:
+        self._max_history = max(1, int(max_history))
+        # Per-symbol bounded FIFO buffers. The bounded size ensures memory stays
+        # predictable since indicators only need a finite lookback window.
+        self._history: dict[Symbol, deque[IndicatorValue]] = {}
+
+    # The name should be defined via an f-string so that instances of the same indicator
+    # can be distinguished via their parameters, e.g. SMAs with different window size.
+    @property
+    @abstractmethod
+    def name(self) -> IndicatorName:
+        pass
+
+    def update(self, event: Events.MarketUpdate.OHLCV) -> None:
+        value = self._compute(event)
+        symbol = event.symbol
+        if symbol not in self._history:
+            self._history[symbol] = deque(maxlen=self._max_history)
+        self._history[symbol].append(value)
+
+    @abstractmethod
+    def _compute(self, event: Events.MarketUpdate.OHLCV) -> IndicatorValue:
+        pass
+
+    def latest(self, symbol: Symbol) -> IndicatorValue:
+        return self[symbol, -1]
+
+    # Supports standard negative indexing, e.g. `indicator["AAPL", -2]`.
+    def __getitem__(self, key: tuple[Symbol, int]) -> IndicatorValue:
+        symbol, index = key
+        history = self._history.get(symbol)
+        if history is None:
+            return IndicatorValue(float("nan"))
+        try:
+            return history[index]
+        except IndexError:
+            return IndicatorValue(float("nan"))
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOrder:
+    order: Events.BrokerRequest.SubmitOrder
+    filled_quantity: FilledQuantity
+
+
+class StrategyBase(
+    SubscriberBase,
+    EmitterBase[
+        Events.BrokerRequest.SubmitOrder
+        | Events.BrokerRequest.ModifyOrder
+        | Events.BrokerRequest.CancelOrder
+        | Events.StrategyUpdate.IndicatorUpdate
+    ],
+):
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__(event_bus)
+
+        self._subscribe_to_events(
+            Events.MarketUpdate.OHLCV,
+            Events.BrokerResponse.OrderAccepted,
+            Events.BrokerResponse.OrderRejected,
+            Events.BrokerResponse.ModificationAccepted,
+            Events.BrokerResponse.ModificationRejected,
+            Events.BrokerResponse.CancellationAccepted,
+            Events.BrokerResponse.CancellationRejected,
+            Events.BrokerResponse.Fill,
+            Events.BrokerResponse.OrderExpired,
+        )
+
+        self._current_symbol: Symbol | None = None
+        self._current_event_ns: UnixNanoseconds | None = None
+
+        self._indicators: dict[IndicatorName, IndicatorBase] = {}
+
+        # `_submitted*` dicts store in-flight requests awaiting broker acknowledgement.
+        # Orders move to `_pending_orders` on acceptance or are removed on rejection.
+        self._submitted_orders: dict[
+            InternalOrderId, Events.BrokerRequest.SubmitOrder
+        ] = {}
+        self._submitted_modifications: dict[
+            InternalOrderId, Events.BrokerRequest.ModifyOrder
+        ] = {}
+        self._submitted_cancellations: dict[
+            InternalOrderId, Events.BrokerRequest.CancelOrder
+        ] = {}
+
+        # Tracks accepted orders and their cumulative filled quantity. Orders leave
+        # this dict on full fill, cancellation, or expiry.
+        self._pending_orders: dict[InternalOrderId, PendingOrder] = {}
+
+        self._position_sizes: dict[Symbol, PositionSize] = {}
+        self._average_entry_prices: dict[Symbol, ScaledPrice] = {}
+
+        # Must be last so base class state exists before the subclass's `setup()` runs.
+        self.setup()
+
+    # Subclasses implement `setup()` instead of `__init__` to avoid `super().__init__`.
+    @abstractmethod
+    def setup(self) -> None:
+        pass
+
+    def add_indicator(self, indicator: IndicatorBase) -> IndicatorBase:
+        if indicator.name in self._indicators:
+            raise ValueError(
+                f"Indicator with name '{indicator.name}' is already registered."
+            )
+        self._indicators[indicator.name] = indicator
+        # Returns indicator for inline assignment: `self.sma = self.add_indicator(...)`.
+        return indicator
+
+    def _on_event(self, event: EventBase) -> None:
+        match event:
+            case Events.MarketUpdate.OHLCV() as ohlcv_event:
+                self._on_market_update(ohlcv_event)
+            case Events.BrokerResponse.OrderAccepted() as order_accepted_event:
+                self._on_order_accepted(order_accepted_event)
+            case Events.BrokerResponse.OrderRejected() as order_rejected_event:
+                self._on_order_rejected(order_rejected_event)
+            case Events.BrokerResponse.ModificationAccepted() as mod_accepted_event:
+                self._on_modification_accepted(mod_accepted_event)
+            case Events.BrokerResponse.ModificationRejected() as mod_rejected_event:
+                self._on_modification_rejected(mod_rejected_event)
+            case Events.BrokerResponse.CancellationAccepted() as cancel_accepted_event:
+                self._on_cancellation_accepted(cancel_accepted_event)
+            case Events.BrokerResponse.CancellationRejected() as cancel_rejected_event:
+                self._on_cancellation_rejected(cancel_rejected_event)
+            case Events.BrokerResponse.Fill() as fill_event:
+                self._on_fill(fill_event)
+            case Events.BrokerResponse.OrderExpired() as order_expired_event:
+                self._on_order_expired(order_expired_event)
+            case _:
+                return
+
+    # Wraps the abstract `on_market_update` with internal plumbing.
+    def _on_market_update(self, event: Events.MarketUpdate.OHLCV) -> None:
+        self._current_symbol = event.symbol
+        self._current_event_ns = event.occurred_at_ns
+        for indicator in self._indicators.values():
+            indicator.update(event)
+        self.on_market_update(event)
+        # Emitted after `on_market_update` so strategy logic isn't delayed by emission.
+        self._emit_indicator_update(event)
+
+    @abstractmethod
+    def on_market_update(self, event: Events.MarketUpdate.OHLCV) -> None:
+        pass
+
+    def _emit_indicator_update(self, source_event: Events.MarketUpdate.OHLCV) -> None:
+        if not self._indicators:
+            return
+
+        assert self._current_symbol is not None
+        assert self._current_event_ns is not None
+
+        indicator_values = {
+            name: indicator.latest(self._current_symbol)
+            for name, indicator in self._indicators.items()
+        }
+
+        self._emit_event(
+            Events.StrategyUpdate.IndicatorUpdate(
+                occurred_at_ns=self._current_event_ns,
+                created_at_ns=self._current_event_ns,
+                symbol=self._current_symbol,
+                source_event=source_event,
+                indicator_values=indicator_values,
+            )
+        )
+
+    # Convenience properties so `on_market_update` can query position state for the
+    # current symbol.
+    @property
+    def position_size(self) -> PositionSize:
+        assert self._current_symbol is not None
+        return self._position_sizes.get(self._current_symbol, PositionSize(0))
+
+    @property
+    def flat(self) -> bool:
+        return self.position_size == 0
+
+    @property
+    def average_entry_price(self) -> ScaledPrice | None:
+        assert self._current_symbol is not None
+        return self._average_entry_prices.get(self._current_symbol)
+
+    def submit_order(
+        self,
+        symbol: Symbol,
+        order_type: Models.OrderType,
+        side: Models.TradeSide,
+        quantity: Quantity,
+        limit_price: ScaledPrice | None = None,
+        stop_price: ScaledPrice | None = None,
+    ) -> InternalOrderId:
+        assert self._current_event_ns is not None
+
+        internal_order_id = InternalOrderId(uuid.uuid4())
+
+        event = Events.BrokerRequest.SubmitOrder(
+            occurred_at_ns=self._current_event_ns,
+            created_at_ns=self._current_event_ns,
+            internal_order_id=internal_order_id,
+            symbol=symbol,
+            order_type=order_type,
+            side=side,
+            quantity=quantity,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+
+        self._submitted_orders[internal_order_id] = event
+        self._emit_event(event)
+        return internal_order_id
+
+    # Returns False if the order is not in `_pending_orders` (i.e. not modifiable).
+    def submit_modification(
+        self,
+        internal_order_id: InternalOrderId,
+        quantity: Quantity,
+        limit_price: ScaledPrice | None = None,
+        stop_price: ScaledPrice | None = None,
+    ) -> bool:
+        assert self._current_event_ns is not None
+
+        pending = self._pending_orders.get(internal_order_id)
+        if pending is None:
+            return False
+
+        event = Events.BrokerRequest.ModifyOrder(
+            occurred_at_ns=self._current_event_ns,
+            created_at_ns=self._current_event_ns,
+            internal_order_id=internal_order_id,
+            symbol=pending.order.symbol,
+            quantity=quantity,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+
+        self._submitted_modifications[internal_order_id] = event
+        self._emit_event(event)
+        return True
+
+    # Returns False if the order is not in `_pending_orders` (i.e. not cancellable).
+    def submit_cancellation(self, internal_order_id: InternalOrderId) -> bool:
+        assert self._current_event_ns is not None
+
+        pending = self._pending_orders.get(internal_order_id)
+        if pending is None:
+            return False
+
+        event = Events.BrokerRequest.CancelOrder(
+            occurred_at_ns=self._current_event_ns,
+            created_at_ns=self._current_event_ns,
+            internal_order_id=internal_order_id,
+            symbol=pending.order.symbol,
+        )
+
+        self._submitted_cancellations[internal_order_id] = event
+        self._emit_event(event)
+        return True
+
+    # Broker implementations must emit OrderAccepted before any Fill for the same order,
+    # otherwise fills would arrive before `_pending_orders` has the entry to update.
+    def _on_order_accepted(self, event: Events.BrokerResponse.OrderAccepted) -> None:
+        order = self._submitted_orders.pop(event.internal_order_id, None)
+        if order is not None:
+            self._pending_orders[event.internal_order_id] = PendingOrder(
+                order, FilledQuantity(0)
+            )
+
+    def _on_order_rejected(self, event: Events.BrokerResponse.OrderRejected) -> None:
+        self._submitted_orders.pop(event.internal_order_id, None)
+
+    def _on_modification_accepted(
+        self, event: Events.BrokerResponse.ModificationAccepted
+    ) -> None:
+        modification = self._submitted_modifications.pop(event.internal_order_id, None)
+        if modification is not None:
+            pending = self._pending_orders.get(event.internal_order_id)
+            if pending is not None:
+                updated_order = Events.BrokerRequest.SubmitOrder(
+                    occurred_at_ns=pending.order.occurred_at_ns,
+                    created_at_ns=pending.order.created_at_ns,
+                    internal_order_id=pending.order.internal_order_id,
+                    symbol=pending.order.symbol,
+                    order_type=pending.order.order_type,
+                    side=pending.order.side,
+                    quantity=modification.quantity,
+                    limit_price=modification.limit_price,
+                    stop_price=modification.stop_price,
+                )
+                # Check necessary because a quantity reduction may retroactively fully
+                # fill the order if fills arrived while the modification was in-flight.
+                if pending.filled_quantity >= modification.quantity:
+                    self._pending_orders.pop(event.internal_order_id)
+                else:
+                    self._pending_orders[event.internal_order_id] = PendingOrder(
+                        updated_order,
+                        pending.filled_quantity,
+                    )
+
+    def _on_modification_rejected(
+        self, event: Events.BrokerResponse.ModificationRejected
+    ) -> None:
+        self._submitted_modifications.pop(event.internal_order_id, None)
+
+    def _on_cancellation_accepted(
+        self, event: Events.BrokerResponse.CancellationAccepted
+    ) -> None:
+        self._submitted_cancellations.pop(event.internal_order_id, None)
+        self._pending_orders.pop(event.internal_order_id, None)
+        # In-flight modifications will not get a response after cancellation.
+        self._submitted_modifications.pop(event.internal_order_id, None)
+
+    def _on_cancellation_rejected(
+        self, event: Events.BrokerResponse.CancellationRejected
+    ) -> None:
+        self._submitted_cancellations.pop(event.internal_order_id, None)
+
+    def _on_fill(self, event: Events.BrokerResponse.Fill) -> None:
+        self._update_position_size_and_avg_entry_price(event)
+        self._update_pending_orders(event)
+
+    def _update_pending_orders(self, event: Events.BrokerResponse.Fill) -> None:
+        pending = self._pending_orders.get(event.internal_order_id)
+        # The order may already be gone (prior fill, cancellation, or expiry).
+        if pending is None:
+            return
+        new_filled_quantity = FilledQuantity(
+            pending.filled_quantity + event.filled_quantity
+        )
+        if new_filled_quantity >= pending.order.quantity:
+            self._pending_orders.pop(event.internal_order_id)
+        else:
+            self._pending_orders[event.internal_order_id] = PendingOrder(
+                pending.order, new_filled_quantity
+            )
+
+    def _update_position_size_and_avg_entry_price(
+        self, event: Events.BrokerResponse.Fill
+    ) -> None:
+        signed_quantity = (
+            event.filled_quantity
+            if event.side == Models.TradeSide.BUY
+            else -event.filled_quantity
+        )
+
+        # Default 0 so the first fill is handled as a fresh entry below.
+        old_position = self._position_sizes.get(event.symbol, 0)
+        old_avg_entry_price = self._average_entry_prices.get(event.symbol, 0)
+        new_position = old_position + signed_quantity
+
+        # Flat: no position, no meaningful average entry price.
+        if new_position == 0:
+            self._position_sizes.pop(event.symbol, None)
+            self._average_entry_prices.pop(event.symbol, None)
+            return
+        # Fresh entry or position flip: old average is irrelevant.
+        elif old_position == 0 or old_position * new_position < 0:
+            new_avg_entry_price = event.fill_price
+        # Adding to existing position: weighted average.
+        elif old_position * signed_quantity > 0:
+            new_avg_entry_price = ScaledPrice(
+                (
+                    old_avg_entry_price * abs(old_position)
+                    + event.fill_price * abs(signed_quantity)
+                )
+                // abs(new_position)
+            )
+        # Partial close: avg unchanged, remaining shares entered at old avg.
+        else:
+            new_avg_entry_price = ScaledPrice(old_avg_entry_price)
+
+        self._position_sizes[event.symbol] = PositionSize(new_position)
+        self._average_entry_prices[event.symbol] = ScaledPrice(new_avg_entry_price)
+
+    def _on_order_expired(self, event: Events.BrokerResponse.OrderExpired) -> None:
+        self._pending_orders.pop(event.internal_order_id, None)
+        # The order is dead, so any in-flight modification or cancellation will never
+        # get a response. Clean up to prevent leaks.
+        self._submitted_modifications.pop(event.internal_order_id, None)
+        self._submitted_cancellations.pop(event.internal_order_id, None)
