@@ -8,6 +8,29 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from queue import Queue
 
+__all__ = [
+    "UnixNanoseconds",
+    "ScaledPrice",
+    "IndicatorValue",
+    "Volume",
+    "Quantity",
+    "FilledQuantity",
+    "PositionSize",
+    "Symbol",
+    "IndicatorName",
+    "InternalOrderId",
+    "InternalFillId",
+    "BrokerOrderId",
+    "BrokerFillId",
+    "Models",
+    "Events",
+    "EventBus",
+    "BrokerBase",
+    "DatafeedBase",
+    "IndicatorBase",
+    "StrategyBase",
+]
+
 # ——————————————————————————————————————————————————————————————————————————————————————
 # DOMAIN-SPECIFIC TYPE DEFINITIONS
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -63,7 +86,7 @@ class Models:
 
 # Defined outside `Events` so nested classes within `Events` can inherit from it.
 @dataclass(kw_only=True, frozen=True, slots=True)
-class EventBase:
+class _EventBase:
     occurred_at_ns: UnixNanoseconds
     created_at_ns: UnixNanoseconds
 
@@ -71,7 +94,7 @@ class EventBase:
 class Events:
     class MarketUpdate:
         @dataclass(kw_only=True, frozen=True, slots=True)
-        class OHLCV(EventBase):
+        class OHLCV(_EventBase):
             symbol: Symbol
             record_type: typing.Literal[
                 Models.RecordType.OHLCV_1S,
@@ -87,14 +110,14 @@ class Events:
 
     class StrategyUpdate:
         @dataclass(kw_only=True, frozen=True, slots=True)
-        class IndicatorUpdate(EventBase):
+        class IndicatorUpdate(_EventBase):
             symbol: Symbol
             source_event: "Events.MarketUpdate.OHLCV"
             indicator_values: dict[IndicatorName, IndicatorValue]
 
     class BrokerRequest:
         @dataclass(kw_only=True, frozen=True, slots=True)
-        class _RequestBase(EventBase):
+        class _RequestBase(_EventBase):
             internal_order_id: InternalOrderId
             symbol: Symbol
 
@@ -118,7 +141,7 @@ class Events:
 
     class BrokerResponse:
         @dataclass(kw_only=True, frozen=True, slots=True)
-        class _ResponseBase(EventBase):
+        class _ResponseBase(_EventBase):
             internal_order_id: InternalOrderId
             # Carried for reconciliation against broker statements. Optional because a
             # rejection may arrive before the broker has assigned an ID.
@@ -174,12 +197,12 @@ class Events:
 
 
 # Defines the subscriber interface that `EventBus` depends on. A protocol is used
-# because `SubscriberBase` is defined after `EventBus`.
-class SubscriberLike(typing.Protocol):
+# because `_SubscriberBase` is defined after `EventBus`.
+class _SubscriberLike(typing.Protocol):
     def wait_until_idle(self) -> None: ...
     @property
     def is_idle(self) -> bool: ...
-    def receive(self, event: EventBase) -> None: ...
+    def receive(self, event: _EventBase) -> None: ...
 
 
 class EventBus:
@@ -187,24 +210,24 @@ class EventBus:
         # Using a set as the defaultdict's value avoids needing additional logic to
         # guard against duplicate subscriptions in the `add_event_subscription` method.
         self._per_event_subscriptions: defaultdict[
-            type[EventBase], set[SubscriberLike]
+            type[_EventBase], set[_SubscriberLike]
         ] = defaultdict(set)
         # Each subscriber runs in its own thread. The Lock ensures that only one
         # subscriber thread at a time can access `_per_event_subscriptions`.
         self._lock: threading.Lock = threading.Lock()
 
     def add_event_subscription(
-        self, subscriber: SubscriberLike, event_type: type[EventBase]
+        self, subscriber: _SubscriberLike, event_type: type[_EventBase]
     ) -> None:
         with self._lock:
             self._per_event_subscriptions[event_type].add(subscriber)
 
-    def remove_subscriber(self, subscriber: SubscriberLike) -> None:
+    def remove_subscriber(self, subscriber: _SubscriberLike) -> None:
         with self._lock:
             for subscriber_set in self._per_event_subscriptions.values():
                 subscriber_set.discard(subscriber)
 
-    def publish_event_to_system(self, event: EventBase) -> None:
+    def publish_event_to_system(self, event: _EventBase) -> None:
         # Copy under the Lock and iterate outside it so the Lock is held as briefly
         # as possible and concurrent publishes from other threads are not blocked.
         with self._lock:
@@ -236,18 +259,18 @@ class EventBus:
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
-class ComponentBase(ABC):
+class _ComponentBase(ABC):
     def __init__(self, event_bus: EventBus) -> None:
         # The concrete `EventBus` instance is injected rather than a global instance so
         # multiple independent systems could co-exist within the same runtime.
         self._event_bus: EventBus = event_bus
 
 
-class SubscriberBase(ComponentBase):
+class _SubscriberBase(_ComponentBase):
     def __init__(self, event_bus: EventBus) -> None:
         super().__init__(event_bus)
         # None acts as a poison pill that tells the event loop to shut down.
-        self._queue: Queue[EventBase | None] = Queue()
+        self._queue: Queue[_EventBase | None] = Queue()
         # Thread-safe flag (no Lock needed). Set before starting the thread so receive
         # can accept events immediately; otherwise they'd be silently dropped.
         self._running: threading.Event = threading.Event()
@@ -269,7 +292,7 @@ class SubscriberBase(ComponentBase):
             return True
         return self._queue.unfinished_tasks == 0
 
-    def receive(self, event: EventBase) -> None:
+    def receive(self, event: _EventBase) -> None:
         if self._running.is_set():
             self._queue.put(event)
 
@@ -285,7 +308,7 @@ class SubscriberBase(ComponentBase):
         if threading.current_thread() is not self._thread:
             self._thread.join()
 
-    def _subscribe_to_events(self, *event_types: type[EventBase]):
+    def _subscribe_to_events(self, *event_types: type[_EventBase]):
         for event_type in event_types:
             self._event_bus.add_event_subscription(self, event_type)
 
@@ -310,7 +333,7 @@ class SubscriberBase(ComponentBase):
             self._running.clear()
 
     @abstractmethod
-    def _on_event(self, event: EventBase):
+    def _on_event(self, event: _EventBase):
         pass
 
     @abstractmethod
@@ -318,19 +341,19 @@ class SubscriberBase(ComponentBase):
         pass
 
 
-# Parameterizes `EmitterBase` so each subclass must declare which event types it emits.
-EmittableEventType = typing.TypeVar("EmittableEventType", bound=EventBase)
+# Parameterizes `_EmitterBase` so each subclass must declare which event types it emits.
+_EmittableEventType = typing.TypeVar("_EmittableEventType", bound=_EventBase)
 
 
 # Subclasses specify their allowed event types, e.g.
-# `class DatafeedBase(EmitterBase[<Events.<NestedNamespace>.SomeEventType>])`.
-class EmitterBase(ComponentBase, typing.Generic[EmittableEventType]):
-    def _emit_event(self, event: EmittableEventType) -> None:
+# `class DatafeedBase(_EmitterBase[<Events.<NestedNamespace>.SomeEventType>])`.
+class _EmitterBase(_ComponentBase, typing.Generic[_EmittableEventType]):
+    def _emit_event(self, event: _EmittableEventType) -> None:
         self._event_bus.publish_event_to_system(event)
 
 
 # Mixin class for components that needs to manage an external connection lifecycle.
-class ExternalComponentMixin(ABC):
+class _ExternalComponentMixin(ABC):
     @abstractmethod
     def connect(self) -> None:
         pass
@@ -346,9 +369,9 @@ class ExternalComponentMixin(ABC):
 
 
 class BrokerBase(
-    ExternalComponentMixin,
-    SubscriberBase,
-    EmitterBase[
+    _ExternalComponentMixin,
+    _SubscriberBase,
+    _EmitterBase[
         Events.BrokerResponse.OrderAccepted
         | Events.BrokerResponse.OrderRejected
         | Events.BrokerResponse.ModificationAccepted
@@ -368,7 +391,7 @@ class BrokerBase(
             Events.BrokerRequest.CancelOrder,
         )
 
-    def _on_event(self, event: EventBase) -> None:
+    def _on_event(self, event: _EventBase) -> None:
         match event:
             case Events.BrokerRequest.SubmitOrder() as submit_order_event:
                 self._on_submit_order(submit_order_event)
@@ -392,7 +415,7 @@ class BrokerBase(
         pass
 
 
-class DatafeedBase(ExternalComponentMixin, EmitterBase[Events.MarketUpdate.OHLCV]):
+class DatafeedBase(_ExternalComponentMixin, _EmitterBase[Events.MarketUpdate.OHLCV]):
     def __init__(self, event_bus: EventBus):
         super().__init__(event_bus)
 
@@ -450,14 +473,14 @@ class IndicatorBase(ABC):
 
 
 @dataclass(frozen=True, slots=True)
-class PendingOrder:
+class _PendingOrder:
     order: Events.BrokerRequest.SubmitOrder
     filled_quantity: FilledQuantity
 
 
 class StrategyBase(
-    SubscriberBase,
-    EmitterBase[
+    _SubscriberBase,
+    _EmitterBase[
         Events.BrokerRequest.SubmitOrder
         | Events.BrokerRequest.ModifyOrder
         | Events.BrokerRequest.CancelOrder
@@ -498,7 +521,7 @@ class StrategyBase(
 
         # Tracks accepted orders and their cumulative filled quantity. Orders leave
         # this dict on full fill, cancellation, or expiry.
-        self._pending_orders: dict[InternalOrderId, PendingOrder] = {}
+        self._pending_orders: dict[InternalOrderId, _PendingOrder] = {}
 
         self._position_sizes: dict[Symbol, PositionSize] = {}
         self._average_entry_prices: dict[Symbol, ScaledPrice] = {}
@@ -520,7 +543,7 @@ class StrategyBase(
         # Returns indicator for inline assignment: `self.sma = self.add_indicator(...)`.
         return indicator
 
-    def _on_event(self, event: EventBase) -> None:
+    def _on_event(self, event: _EventBase) -> None:
         match event:
             case Events.MarketUpdate.OHLCV() as ohlcv_event:
                 self._on_market_update(ohlcv_event)
@@ -676,7 +699,7 @@ class StrategyBase(
     def _on_order_accepted(self, event: Events.BrokerResponse.OrderAccepted) -> None:
         order = self._submitted_orders.pop(event.internal_order_id, None)
         if order is not None:
-            self._pending_orders[event.internal_order_id] = PendingOrder(
+            self._pending_orders[event.internal_order_id] = _PendingOrder(
                 order, FilledQuantity(0)
             )
 
@@ -706,7 +729,7 @@ class StrategyBase(
                 if pending.filled_quantity >= modification.quantity:
                     self._pending_orders.pop(event.internal_order_id)
                 else:
-                    self._pending_orders[event.internal_order_id] = PendingOrder(
+                    self._pending_orders[event.internal_order_id] = _PendingOrder(
                         updated_order,
                         pending.filled_quantity,
                     )
@@ -744,7 +767,7 @@ class StrategyBase(
         if new_filled_quantity >= pending.order.quantity:
             self._pending_orders.pop(event.internal_order_id)
         else:
-            self._pending_orders[event.internal_order_id] = PendingOrder(
+            self._pending_orders[event.internal_order_id] = _PendingOrder(
                 pending.order, new_filled_quantity
             )
 
