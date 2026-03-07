@@ -22,6 +22,7 @@ __all__ = [
     "InternalFillId",
     "BrokerOrderId",
     "BrokerFillId",
+    "RunId",
     "Models",
     "Events",
     "EventBus",
@@ -29,6 +30,7 @@ __all__ = [
     "DatafeedBase",
     "IndicatorBase",
     "StrategyBase",
+    "RunRecorderBase",
 ]
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -53,6 +55,7 @@ InternalOrderId = typing.NewType("InternalOrderId", uuid.UUID)
 InternalFillId = typing.NewType("InternalFillId", uuid.UUID)
 BrokerOrderId = typing.NewType("BrokerOrderId", str)
 BrokerFillId = typing.NewType("BrokerFillId", str)
+RunId = typing.NewType("RunId", str)
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -815,3 +818,31 @@ class StrategyBase(
         # get a response. Clean up to prevent leaks.
         self._submitted_modifications.pop(event.internal_order_id, None)
         self._submitted_cancellations.pop(event.internal_order_id, None)
+
+
+class RunRecorderBase(_SubscriberBase):
+    def __init__(self, event_bus: EventBus):
+        super().__init__(event_bus)
+
+        self._subscribe_to_events(
+            Events.StrategyUpdate.IndicatorUpdate,
+            Events.BrokerRequest.SubmitOrder,
+            Events.BrokerRequest.ModifyOrder,
+            Events.BrokerRequest.CancelOrder,
+            Events.BrokerResponse.OrderAccepted,
+            Events.BrokerResponse.OrderRejected,
+            Events.BrokerResponse.ModificationAccepted,
+            Events.BrokerResponse.ModificationRejected,
+            Events.BrokerResponse.CancellationAccepted,
+            Events.BrokerResponse.CancellationRejected,
+            Events.BrokerResponse.Fill,
+            Events.BrokerResponse.OrderExpired,
+        )
+
+    @abstractmethod
+    def _on_event(self, event: _EventBase):
+        pass
+
+    @abstractmethod
+    def _on_exception(self, exception: Exception):
+        pass
