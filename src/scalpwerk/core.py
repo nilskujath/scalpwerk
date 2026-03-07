@@ -1,4 +1,5 @@
 import threading
+import time
 import typing
 import uuid
 
@@ -490,8 +491,16 @@ class StrategyBase(
         | Events.StrategyUpdate.IndicatorUpdate
     ],
 ):
-    def __init__(self, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        event_bus: EventBus,
+        symbols: list[Symbol],
+        record_type: Models.RecordType,
+    ) -> None:
         super().__init__(event_bus)
+
+        self._symbols: list[Symbol] = symbols
+        self._record_type: Models.RecordType = record_type
 
         self._subscribe_to_events(
             Events.MarketUpdate.OHLCV,
@@ -846,3 +855,31 @@ class RunRecorderBase(_SubscriberBase):
     @abstractmethod
     def _on_exception(self, exception: Exception):
         pass
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        strategies: dict[
+            type[StrategyBase],
+            tuple[list[Symbol], Models.RecordType],
+        ],
+        broker: type[BrokerBase],
+        datafeed: type[DatafeedBase],
+    ) -> None:
+        self._strategies: dict[
+            type[StrategyBase],
+            tuple[list[Symbol], Models.RecordType],
+        ] = strategies
+        self._broker: type[BrokerBase] = broker
+        self._datafeed: type[DatafeedBase] = datafeed
+
+        self._run_id: RunId | None = None
+
+    def run(self):
+        self._run_id: RunId = self._generate_run_id()
+
+    def _generate_run_id(self) -> RunId:
+        timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
+        strategy_names = "_".join(s.__name__ for s in self._strategies)
+        return RunId(f"{timestamp}_{strategy_names}")
