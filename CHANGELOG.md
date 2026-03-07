@@ -2,6 +2,28 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-03-07)
+
+### Features
+
+- Add Orchestrator and _RunRecorder (both unfinished)
+  ([`3040707`](https://github.com/nilskujath/scalpwerk/commit/3040707087c5338cbd51d893e081bc102ce0c887))
+
+- Add Orchestrator and inject symbols/record_type into StrategyBase
+  ([`820c3d5`](https://github.com/nilskujath/scalpwerk/commit/820c3d5f3ea9d338326928e43c79c08489afc6a4))
+
+### Refactoring
+
+- Add __all__ exports and prefix internal classes with _
+  ([`40786c2`](https://github.com/nilskujath/scalpwerk/commit/40786c272b5f71b3b3c3695753d957179c863cc1))
+
+- Add domain-specific NewTypes, condense comments, and harden type safety
+  ([`57c2cf9`](https://github.com/nilskujath/scalpwerk/commit/57c2cf99e4c8206a263321d83e0fd7b1b12bbe56))
+
+- Move SQLiteRunRecorder out of core.py
+  ([`ee06b25`](https://github.com/nilskujath/scalpwerk/commit/ee06b25d7f2823ecdc58c3b6acea7f516a6e2a29))
+
+
 ## v1.4.0 (2026-03-03)
 
 ### Features
