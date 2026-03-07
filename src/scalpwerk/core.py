@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from queue import Queue
 
 __all__ = [
@@ -31,7 +32,7 @@ __all__ = [
     "DatafeedBase",
     "IndicatorBase",
     "StrategyBase",
-    "RunRecorderBase",
+    "Orchestrator",
 ]
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -829,9 +830,12 @@ class StrategyBase(
         self._submitted_cancellations.pop(event.internal_order_id, None)
 
 
-class RunRecorderBase(_SubscriberBase):
-    def __init__(self, event_bus: EventBus):
+class _RunRecorder(_SubscriberBase):
+    def __init__(self, event_bus: EventBus, sqlite_db_path: Path, run_id: RunId):
         super().__init__(event_bus)
+
+        self._sqlite_db_path: Path = Path(sqlite_db_path)
+        self._run_id: RunId = RunId(run_id)
 
         self._subscribe_to_events(
             Events.StrategyUpdate.IndicatorUpdate,
@@ -848,11 +852,9 @@ class RunRecorderBase(_SubscriberBase):
             Events.BrokerResponse.OrderExpired,
         )
 
-    @abstractmethod
     def _on_event(self, event: _EventBase):
         pass
 
-    @abstractmethod
     def _on_exception(self, exception: Exception):
         pass
 
@@ -866,18 +868,26 @@ class Orchestrator:
         ],
         broker: type[BrokerBase],
         datafeed: type[DatafeedBase],
+        sqlite_db_path: Path = Path("runs.db"),
     ) -> None:
         self._strategies: dict[
             type[StrategyBase],
             tuple[list[Symbol], Models.RecordType],
         ] = strategies
-        self._broker: type[BrokerBase] = broker
-        self._datafeed: type[DatafeedBase] = datafeed
+        self._broker_class: type[BrokerBase] = broker
+        self._datafeed_class: type[DatafeedBase] = datafeed
+        self._sqlite_db_path: Path = sqlite_db_path
 
         self._run_id: RunId | None = None
+        self._event_bus: EventBus | None = None
+        self._run_recorder: _RunRecorder | None = None
 
-    def run(self):
-        self._run_id: RunId = self._generate_run_id()
+    def run(self) -> None:
+        self._run_id = self._generate_run_id()
+        self._event_bus = EventBus()
+        self._run_recorder = _RunRecorder(
+            self._event_bus, self._sqlite_db_path, self._run_id
+        )
 
     def _generate_run_id(self) -> RunId:
         timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
