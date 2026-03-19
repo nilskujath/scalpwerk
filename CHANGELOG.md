@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.6.0 (2026-03-19)
+
+### Features
+
+- Implement RunOrchestrator lifecycle with on_fatal shutdown mechanism
+  ([`aa58800`](https://github.com/nilskujath/scalpwerk/commit/aa588000b98b5c50c6f1d9e5326f76281e00c194))
+
+### Refactoring
+
+- Harden _RunRecorder with schema versioning, primary keys, and type safety
+  ([`0d74adb`](https://github.com/nilskujath/scalpwerk/commit/0d74adbed43e6f571355835fa788745ef13e8445))
+
+
 ## v1.5.0 (2026-03-07)
 
 ### Features
