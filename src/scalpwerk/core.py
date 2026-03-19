@@ -1,3 +1,4 @@
+import sqlite3
 import threading
 import time
 import typing
@@ -11,20 +12,22 @@ from pathlib import Path
 from queue import Queue
 
 __all__ = [
+    # Domain-Specific Type Definitions
     "UnixNanoseconds",
     "ScaledPrice",
-    "IndicatorValue",
     "Volume",
     "Quantity",
     "FilledQuantity",
     "PositionSize",
-    "Symbol",
     "IndicatorName",
+    "IndicatorValue",
+    "Symbol",
     "InternalOrderId",
     "InternalFillId",
     "BrokerOrderId",
     "BrokerFillId",
     "RunId",
+    # Public Classes
     "Models",
     "Events",
     "EventBus",
@@ -37,22 +40,17 @@ __all__ = [
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # DOMAIN-SPECIFIC TYPE DEFINITIONS
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 UnixNanoseconds = typing.NewType("UnixNanoseconds", int)
-
 ScaledPrice = typing.NewType("ScaledPrice", int)
-IndicatorValue = typing.NewType("IndicatorValue", float)
-
 Volume = typing.NewType("Volume", int)
 Quantity = typing.NewType("Quantity", int)
 FilledQuantity = typing.NewType("FilledQuantity", int)
 PositionSize = typing.NewType("PositionSize", int)
-
-Symbol = typing.NewType("Symbol", str)
 IndicatorName = typing.NewType("IndicatorName", str)
-
+IndicatorValue = typing.NewType("IndicatorValue", float)
+Symbol = typing.NewType("Symbol", str)
 InternalOrderId = typing.NewType("InternalOrderId", uuid.UUID)
 InternalFillId = typing.NewType("InternalFillId", uuid.UUID)
 BrokerOrderId = typing.NewType("BrokerOrderId", str)
@@ -62,7 +60,6 @@ RunId = typing.NewType("RunId", str)
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # DOMAIN MODEL DEFINITIONS
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 class Models:
@@ -86,7 +83,6 @@ class Models:
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # EVENT DEFINITIONS
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 # Defined outside `Events` so nested classes within `Events` can inherit from it.
@@ -198,7 +194,6 @@ class Events:
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # EVENT BUS DEFINITION
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 # Defines the subscriber interface that `EventBus` depends on. A protocol is used
@@ -261,7 +256,6 @@ class EventBus:
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # GENERAL SYSTEM COMPONENT BASE CLASS DEFINITIONS
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 class _ComponentBase(ABC):
@@ -370,7 +364,6 @@ class _ExternalComponentMixin(ABC):
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # CONCRETE BASE CLASS DEFINITIONS
-# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 class BrokerBase(
@@ -437,6 +430,8 @@ class DatafeedBase(_ExternalComponentMixin, _EmitterBase[Events.MarketUpdate.OHL
 
 # Computes and stores a single scalar value per symbol on each `update` call. Complex
 # indicators must be split into separate instances, e.g. `BollingerUpper` et cetera.
+# Indicators are bar-driven: values are only computed when a new bar arrives.
+# On illiquid assets, be mindful that gaps may cause unexpected indicator behavior.
 class IndicatorBase(ABC):
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
@@ -830,12 +825,307 @@ class StrategyBase(
         self._submitted_cancellations.pop(event.internal_order_id, None)
 
 
-class _RunRecorder(_SubscriberBase):
-    def __init__(self, event_bus: EventBus, sqlite_db_path: Path, run_id: RunId):
-        super().__init__(event_bus)
+# ——————————————————————————————————————————————————————————————————————————————————————
+# SYSTEM ORCHESTRATION UTILITY DEFINITIONS
 
+
+class _RunRecorder(_SubscriberBase):
+    _SCHEMA_VERSION = 1
+
+    _RUN_RECORDER_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT NOT NULL PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS run_strategies (
+            run_id      TEXT NOT NULL REFERENCES runs(run_id),
+            strategy    TEXT NOT NULL,
+            symbol      TEXT NOT NULL,
+            record_type TEXT NOT NULL,
+            PRIMARY KEY (run_id, strategy, symbol, record_type)
+        );
+
+        CREATE TABLE IF NOT EXISTS ohlcv (
+            run_id         TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns INTEGER NOT NULL,
+            created_at_ns  INTEGER NOT NULL,
+            symbol         TEXT    NOT NULL,
+            record_type    TEXT    NOT NULL,
+            open           INTEGER NOT NULL,
+            high           INTEGER NOT NULL,
+            low            INTEGER NOT NULL,
+            close          INTEGER NOT NULL,
+            volume         INTEGER,
+            PRIMARY KEY (run_id, symbol, record_type, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS indicator_values (
+            run_id          TEXT    NOT NULL,
+            symbol          TEXT    NOT NULL,
+            record_type     TEXT    NOT NULL,
+            occurred_at_ns  INTEGER NOT NULL,
+            indicator_name  TEXT    NOT NULL,
+            indicator_value REAL   NOT NULL,
+            PRIMARY KEY (run_id, symbol, record_type, occurred_at_ns, indicator_name),
+            FOREIGN KEY (run_id, symbol, record_type, occurred_at_ns)
+                REFERENCES ohlcv(run_id, symbol, record_type, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_request_submit_order (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            symbol            TEXT    NOT NULL,
+            order_type        TEXT    NOT NULL,
+            side              TEXT    NOT NULL,
+            quantity          INTEGER NOT NULL,
+            limit_price       INTEGER,
+            stop_price        INTEGER,
+            PRIMARY KEY (run_id, internal_order_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_request_modify_order (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            symbol            TEXT    NOT NULL,
+            quantity          INTEGER NOT NULL,
+            limit_price       INTEGER,
+            stop_price        INTEGER,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_request_cancel_order (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            symbol            TEXT    NOT NULL,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_order_accepted (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            PRIMARY KEY (run_id, internal_order_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_order_rejected (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            reason            TEXT    NOT NULL,
+            PRIMARY KEY (run_id, internal_order_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_modification_accepted (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_modification_rejected (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            reason            TEXT    NOT NULL,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_cancellation_accepted (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_cancellation_rejected (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            reason            TEXT    NOT NULL,
+            PRIMARY KEY (run_id, internal_order_id, occurred_at_ns)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_fill (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            symbol            TEXT    NOT NULL,
+            internal_fill_id  TEXT    NOT NULL,
+            broker_fill_id    TEXT,
+            side              TEXT    NOT NULL,
+            filled_quantity   INTEGER NOT NULL,
+            fill_price        INTEGER NOT NULL,
+            exchange          TEXT    NOT NULL,
+            commission        INTEGER,
+            PRIMARY KEY (run_id, internal_fill_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_response_order_expired (
+            run_id            TEXT    NOT NULL REFERENCES runs(run_id),
+            occurred_at_ns    INTEGER NOT NULL,
+            created_at_ns     INTEGER NOT NULL,
+            internal_order_id TEXT    NOT NULL,
+            broker_order_id   TEXT,
+            PRIMARY KEY (run_id, internal_order_id)
+        );
+    """
+
+    _SQL_INSERT_OHLCV = """
+        INSERT INTO ohlcv
+            (run_id, occurred_at_ns, created_at_ns, symbol, record_type,
+             open, high, low, close, volume)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_INDICATOR_VALUE = """
+        INSERT INTO indicator_values
+            (run_id, symbol, record_type, occurred_at_ns,
+             indicator_name, indicator_value)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_SUBMIT_ORDER = """
+        INSERT INTO broker_request_submit_order
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id, symbol,
+             order_type, side, quantity, limit_price, stop_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_MODIFY_ORDER = """
+        INSERT INTO broker_request_modify_order
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id, symbol,
+             quantity, limit_price, stop_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_CANCEL_ORDER = """
+        INSERT INTO broker_request_cancel_order
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id, symbol)
+        VALUES (?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_ORDER_ACCEPTED = """
+        INSERT INTO broker_response_order_accepted
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id)
+        VALUES (?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_ORDER_REJECTED = """
+        INSERT INTO broker_response_order_rejected
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_MODIFICATION_ACCEPTED = """
+        INSERT INTO broker_response_modification_accepted
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id)
+        VALUES (?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_MODIFICATION_REJECTED = """
+        INSERT INTO broker_response_modification_rejected
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_CANCELLATION_ACCEPTED = """
+        INSERT INTO broker_response_cancellation_accepted
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id)
+        VALUES (?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_CANCELLATION_REJECTED = """
+        INSERT INTO broker_response_cancellation_rejected
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id, reason)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_FILL = """
+        INSERT INTO broker_response_fill
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id, symbol, internal_fill_id, broker_fill_id,
+             side, filled_quantity, fill_price, exchange, commission)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    _SQL_INSERT_ORDER_EXPIRED = """
+        INSERT INTO broker_response_order_expired
+            (run_id, occurred_at_ns, created_at_ns, internal_order_id,
+             broker_order_id)
+        VALUES (?, ?, ?, ?, ?)
+    """
+
+    _SQL_CHECK_SCHEMA_VERSION_TABLE_EXISTS = """
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name='schema_version'
+    """
+
+    _SQL_SELECT_SCHEMA_VERSION = """
+        SELECT version FROM schema_version
+    """
+
+    _SQL_INSERT_SCHEMA_VERSION = """
+        INSERT INTO schema_version (version) VALUES (?)
+    """
+
+    _SQL_INSERT_RUN = """
+        INSERT INTO runs (run_id) VALUES (?)
+    """
+
+    _SQL_INSERT_RUN_STRATEGY = """
+        INSERT INTO run_strategies (run_id, strategy, symbol, record_type)
+        VALUES (?, ?, ?, ?)
+    """
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        sqlite_db_path: Path,
+        run_id: RunId,
+        strategies: dict[
+            type[StrategyBase],
+            tuple[Models.RecordType, list[Symbol]],
+        ],
+    ):
+        super().__init__(event_bus)
         self._sqlite_db_path: Path = Path(sqlite_db_path)
         self._run_id: RunId = RunId(run_id)
+        self._strategies: dict[
+            type[StrategyBase],
+            tuple[Models.RecordType, list[Symbol]],
+        ] = strategies
+
+        self._conn: sqlite3.Connection | None = None
 
         self._subscribe_to_events(
             Events.StrategyUpdate.IndicatorUpdate,
@@ -852,11 +1142,274 @@ class _RunRecorder(_SubscriberBase):
             Events.BrokerResponse.OrderExpired,
         )
 
-    def _on_event(self, event: _EventBase):
-        pass
+    def _setup_db(self) -> None:
+        self._conn = sqlite3.connect(self._sqlite_db_path)
 
-    def _on_exception(self, exception: Exception):
-        pass
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA foreign_keys = ON")
+
+        if self._conn.execute(self._SQL_CHECK_SCHEMA_VERSION_TABLE_EXISTS).fetchone():
+            row = self._conn.execute(self._SQL_SELECT_SCHEMA_VERSION).fetchone()
+            version = row[0] if row else None
+            if version != self._SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Schema version mismatch: expected {self._SCHEMA_VERSION},"
+                    f" found {version}"
+                )
+        else:
+            self._conn.executescript(self._RUN_RECORDER_SCHEMA)
+            self._conn.execute(self._SQL_INSERT_SCHEMA_VERSION, (self._SCHEMA_VERSION,))
+
+        self._conn.execute(self._SQL_INSERT_RUN, (str(self._run_id),))
+        self._conn.executemany(
+            self._SQL_INSERT_RUN_STRATEGY,
+            [
+                (str(self._run_id), strategy.__name__, str(symbol), record_type.name)
+                for strategy, (record_type, symbols) in self._strategies.items()
+                for symbol in symbols
+            ],
+        )
+        self._conn.commit()
+
+    def _event_loop(self) -> None:
+        # Called here instead of __init__ so the SQLite connection is created on
+        # the same thread that will use it (SQLite connections are not thread-safe).
+        self._setup_db()
+
+        try:
+            super()._event_loop()
+        finally:
+            if self._conn is not None:
+                self._conn.close()
+
+    def _on_event(self, event: _EventBase) -> None:
+        assert self._conn is not None  # For type checker; always set by _setup_db
+
+        match event:
+            case Events.StrategyUpdate.IndicatorUpdate() as e:
+                src = e.source_event
+                self._conn.execute(
+                    self._SQL_INSERT_OHLCV,
+                    (
+                        str(self._run_id),
+                        int(src.occurred_at_ns),
+                        int(src.created_at_ns),
+                        str(src.symbol),
+                        src.record_type.name,
+                        int(src.open),
+                        int(src.high),
+                        int(src.low),
+                        int(src.close),
+                        int(src.volume) if src.volume is not None else None,
+                    ),
+                )
+                self._conn.executemany(
+                    self._SQL_INSERT_INDICATOR_VALUE,
+                    [
+                        (
+                            str(self._run_id),
+                            str(src.symbol),
+                            src.record_type.name,
+                            int(src.occurred_at_ns),
+                            str(name),
+                            float(value),
+                        )
+                        for name, value in e.indicator_values.items()
+                    ],
+                )
+
+            case Events.BrokerRequest.SubmitOrder() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_SUBMIT_ORDER,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        str(e.symbol),
+                        e.order_type.name,
+                        e.side.name,
+                        int(e.quantity),
+                        int(e.limit_price) if e.limit_price is not None else None,
+                        int(e.stop_price) if e.stop_price is not None else None,
+                    ),
+                )
+
+            case Events.BrokerRequest.ModifyOrder() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_MODIFY_ORDER,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        str(e.symbol),
+                        int(e.quantity),
+                        int(e.limit_price) if e.limit_price is not None else None,
+                        int(e.stop_price) if e.stop_price is not None else None,
+                    ),
+                )
+
+            case Events.BrokerRequest.CancelOrder() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_CANCEL_ORDER,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        str(e.symbol),
+                    ),
+                )
+
+            case Events.BrokerResponse.OrderAccepted() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_ORDER_ACCEPTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                    ),
+                )
+
+            case Events.BrokerResponse.OrderRejected() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_ORDER_REJECTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                        e.reason,
+                    ),
+                )
+
+            case Events.BrokerResponse.ModificationAccepted() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_MODIFICATION_ACCEPTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                    ),
+                )
+
+            case Events.BrokerResponse.ModificationRejected() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_MODIFICATION_REJECTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                        e.reason,
+                    ),
+                )
+
+            case Events.BrokerResponse.CancellationAccepted() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_CANCELLATION_ACCEPTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                    ),
+                )
+
+            case Events.BrokerResponse.CancellationRejected() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_CANCELLATION_REJECTED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                        e.reason,
+                    ),
+                )
+
+            case Events.BrokerResponse.Fill() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_FILL,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                        str(e.symbol),
+                        str(e.internal_fill_id),
+                        str(e.broker_fill_id) if e.broker_fill_id is not None else None,
+                        e.side.name,
+                        int(e.filled_quantity),
+                        int(e.fill_price),
+                        e.exchange,
+                        int(e.commission) if e.commission is not None else None,
+                    ),
+                )
+
+            case Events.BrokerResponse.OrderExpired() as e:
+                self._conn.execute(
+                    self._SQL_INSERT_ORDER_EXPIRED,
+                    (
+                        str(self._run_id),
+                        int(e.occurred_at_ns),
+                        int(e.created_at_ns),
+                        str(e.internal_order_id),
+                        (
+                            str(e.broker_order_id)
+                            if e.broker_order_id is not None
+                            else None
+                        ),
+                    ),
+                )
+
+            case _:
+                return
+
+        self._conn.commit()
+
+    def _on_exception(self, exception: Exception) -> None:
+        if self._conn is not None:
+            self._conn.rollback()
 
 
 class Orchestrator:
@@ -864,7 +1417,7 @@ class Orchestrator:
         self,
         strategies: dict[
             type[StrategyBase],
-            tuple[list[Symbol], Models.RecordType],
+            tuple[Models.RecordType, list[Symbol]],
         ],
         broker: type[BrokerBase],
         datafeed: type[DatafeedBase],
@@ -872,7 +1425,7 @@ class Orchestrator:
     ) -> None:
         self._strategies: dict[
             type[StrategyBase],
-            tuple[list[Symbol], Models.RecordType],
+            tuple[Models.RecordType, list[Symbol]],
         ] = strategies
         self._broker_class: type[BrokerBase] = broker
         self._datafeed_class: type[DatafeedBase] = datafeed
@@ -886,10 +1439,10 @@ class Orchestrator:
         self._run_id = self._generate_run_id()
         self._event_bus = EventBus()
         self._run_recorder = _RunRecorder(
-            self._event_bus, self._sqlite_db_path, self._run_id
+            self._event_bus, self._sqlite_db_path, self._run_id, self._strategies
         )
 
     def _generate_run_id(self) -> RunId:
         timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
-        strategy_names = "_".join(s.__name__ for s in self._strategies)
-        return RunId(f"{timestamp}_{strategy_names}")
+        suffix = uuid.uuid4().hex[:4]
+        return RunId(f"{timestamp}_{suffix}")
