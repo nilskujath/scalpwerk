@@ -1,3 +1,4 @@
+import signal
 import sqlite3
 import threading
 import time
@@ -6,7 +7,7 @@ import uuid
 
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from queue import Queue
@@ -35,7 +36,7 @@ __all__ = [
     "DatafeedBase",
     "IndicatorBase",
     "StrategyBase",
-    "Orchestrator",
+    "RunOrchestrator",
 ]
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -266,8 +267,13 @@ class _ComponentBase(ABC):
 
 
 class _SubscriberBase(_ComponentBase):
-    def __init__(self, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        event_bus: EventBus,
+        on_fatal: typing.Callable[[], None],
+    ) -> None:
         super().__init__(event_bus)
+        self._on_fatal = on_fatal
         # None acts as a poison pill that tells the event loop to shut down.
         self._queue: Queue[_EventBase | None] = Queue()
         # Thread-safe flag (no Lock needed). Set before starting the thread so receive
@@ -330,6 +336,7 @@ class _SubscriberBase(_ComponentBase):
                     self._queue.task_done()
         except Exception:
             self._running.clear()
+            self._on_fatal()
 
     @abstractmethod
     def _on_event(self, event: _EventBase):
@@ -380,8 +387,12 @@ class BrokerBase(
         | Events.BrokerResponse.OrderExpired
     ],
 ):
-    def __init__(self, event_bus: EventBus):
-        super().__init__(event_bus)
+    def __init__(
+        self,
+        event_bus: EventBus,
+        on_fatal: typing.Callable[[], None],
+    ):
+        super().__init__(event_bus, on_fatal=on_fatal)
 
         self._subscribe_to_events(
             Events.BrokerRequest.SubmitOrder,
@@ -414,8 +425,13 @@ class BrokerBase(
 
 
 class DatafeedBase(_ExternalComponentMixin, _EmitterBase[Events.MarketUpdate.OHLCV]):
-    def __init__(self, event_bus: EventBus):
+    def __init__(
+        self,
+        event_bus: EventBus,
+        on_fatal: typing.Callable[[], None],
+    ) -> None:
         super().__init__(event_bus)
+        self._on_fatal = on_fatal
 
     @abstractmethod
     def subscribe(self, symbols: list[Symbol], record_type: Models.RecordType) -> None:
@@ -492,8 +508,9 @@ class StrategyBase(
         event_bus: EventBus,
         symbols: list[Symbol],
         record_type: Models.RecordType,
+        on_fatal: typing.Callable[[], None],
     ) -> None:
-        super().__init__(event_bus)
+        super().__init__(event_bus, on_fatal=on_fatal)
 
         self._symbols: list[Symbol] = symbols
         self._record_type: Models.RecordType = record_type
@@ -1110,15 +1127,16 @@ class _RunRecorder(_SubscriberBase):
     def __init__(
         self,
         event_bus: EventBus,
-        sqlite_db_path: Path,
+        runs_db_path: Path,
         run_id: RunId,
         strategies: dict[
             type[StrategyBase],
             tuple[Models.RecordType, list[Symbol]],
         ],
+        on_fatal: typing.Callable[[], None],
     ):
-        super().__init__(event_bus)
-        self._sqlite_db_path: Path = Path(sqlite_db_path)
+        super().__init__(event_bus, on_fatal=on_fatal)
+        self._runs_db_path: Path = Path(runs_db_path)
         self._run_id: RunId = RunId(run_id)
         self._strategies: dict[
             type[StrategyBase],
@@ -1143,7 +1161,7 @@ class _RunRecorder(_SubscriberBase):
         )
 
     def _setup_db(self) -> None:
-        self._conn = sqlite3.connect(self._sqlite_db_path)
+        self._conn = sqlite3.connect(self._runs_db_path)
 
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
@@ -1412,7 +1430,26 @@ class _RunRecorder(_SubscriberBase):
             self._conn.rollback()
 
 
-class Orchestrator:
+@dataclass
+class _RunInstances:
+    event_bus: EventBus | None = None
+    run_recorder: _RunRecorder | None = None
+    broker: BrokerBase | None = None
+    strategies: list[StrategyBase] = field(default_factory=list)
+    datafeed: DatafeedBase | None = None
+
+    @property
+    def has_run_started(self) -> bool:
+        return (
+            self.event_bus is not None
+            or self.run_recorder is not None
+            or self.broker is not None
+            or len(self.strategies) > 0
+            or self.datafeed is not None
+        )
+
+
+class RunOrchestrator:
     def __init__(
         self,
         strategies: dict[
@@ -1421,28 +1458,102 @@ class Orchestrator:
         ],
         broker: type[BrokerBase],
         datafeed: type[DatafeedBase],
-        sqlite_db_path: Path = Path("runs.db"),
+        runs_db_path: Path = Path("runs.db"),
     ) -> None:
-        self._strategies: dict[
-            type[StrategyBase],
-            tuple[Models.RecordType, list[Symbol]],
-        ] = strategies
-        self._broker_class: type[BrokerBase] = broker
-        self._datafeed_class: type[DatafeedBase] = datafeed
-        self._sqlite_db_path: Path = sqlite_db_path
+        self._strategies = strategies
+        self._broker_class = broker
+        self._datafeed_class = datafeed
+        self._runs_db_path = runs_db_path
 
-        self._run_id: RunId | None = None
-        self._event_bus: EventBus | None = None
-        self._run_recorder: _RunRecorder | None = None
+        self._instances = _RunInstances()
+        self._shutdown_event = threading.Event()
 
     def run(self) -> None:
-        self._run_id = self._generate_run_id()
-        self._event_bus = EventBus()
-        self._run_recorder = _RunRecorder(
-            self._event_bus, self._sqlite_db_path, self._run_id, self._strategies
+        if self._instances.has_run_started:
+            return
+
+        signal.signal(signal.SIGTERM, lambda sig, frame: self._shutdown_event.set())
+        try:
+            self._setup()
+            self._shutdown_event.wait()
+        finally:
+            self._teardown()
+
+    def stop(self) -> None:
+        self._shutdown_event.set()
+
+    def _setup(self) -> None:
+        self._setup_event_bus()
+        self._setup_run_recorder()
+        self._setup_broker()
+        self._setup_strategies()
+        self._setup_datafeed()
+
+    def _setup_event_bus(self) -> None:
+        self._instances.event_bus = EventBus()
+
+    def _setup_run_recorder(self) -> None:
+        assert self._instances.event_bus is not None
+        self._instances.run_recorder = _RunRecorder(
+            self._instances.event_bus,
+            self._runs_db_path,
+            RunId(f"{time.strftime('%Y-%m-%d-%H-%M-%S')}_{uuid.uuid4().hex[:4]}"),
+            self._strategies,
+            on_fatal=self._shutdown_event.set,
         )
 
-    def _generate_run_id(self) -> RunId:
-        timestamp = time.strftime("%Y-%m-%d-%H-%M-%S")
-        suffix = uuid.uuid4().hex[:4]
-        return RunId(f"{timestamp}_{suffix}")
+    def _setup_broker(self) -> None:
+        assert self._instances.event_bus is not None
+        self._instances.broker = self._broker_class(
+            self._instances.event_bus, on_fatal=self._shutdown_event.set
+        )
+        self._instances.broker.connect()
+
+    def _setup_strategies(self) -> None:
+        assert self._instances.event_bus is not None
+        self._instances.strategies = [
+            strategy_class(
+                self._instances.event_bus,
+                symbols,
+                record_type,
+                on_fatal=self._shutdown_event.set,
+            )
+            for strategy_class, (record_type, symbols) in self._strategies.items()
+        ]
+
+    def _setup_datafeed(self) -> None:
+        assert self._instances.event_bus is not None
+        self._instances.datafeed = self._datafeed_class(
+            self._instances.event_bus, on_fatal=self._shutdown_event.set
+        )
+        self._instances.datafeed.connect()
+        for record_type, symbols in self._strategies.values():
+            self._instances.datafeed.subscribe(symbols, record_type)
+
+    def _teardown(self) -> None:
+        if self._instances.datafeed is not None:
+            try:
+                for record_type, symbols in self._strategies.values():
+                    self._instances.datafeed.unsubscribe(symbols, record_type)
+                self._instances.datafeed.disconnect()
+            except Exception:
+                pass
+
+        for strategy in self._instances.strategies:
+            try:
+                strategy.shutdown()
+            except Exception:
+                pass
+
+        if self._instances.broker is not None:
+            try:
+                self._instances.broker.shutdown()
+                self._instances.broker.disconnect()
+            except Exception:
+                pass
+
+        if self._instances.run_recorder is not None:
+            try:
+                self._instances.run_recorder.shutdown()
+            except Exception:
+                pass
