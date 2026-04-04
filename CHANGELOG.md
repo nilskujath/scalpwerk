@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v1.7.0 (2026-04-04)
+
+### Features
+
+- Add library-style logging to core.py
+  ([`80ebaaa`](https://github.com/nilskujath/scalpwerk/commit/80ebaaa52734024904a4a8dc591f91347c6b6649))
+
+
 ## v1.6.0 (2026-03-19)
 
 ### Features
