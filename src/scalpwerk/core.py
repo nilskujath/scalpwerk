@@ -1,3 +1,4 @@
+import logging
 import signal
 import sqlite3
 import threading
@@ -38,6 +39,10 @@ __all__ = [
     "StrategyBase",
     "RunOrchestrator",
 ]
+
+# No handlers configured here; application code should call logging.basicConfig() or
+# logging.config.dictConfig() before RunOrchestrator.run().
+logger = logging.getLogger(__name__)
 
 # ——————————————————————————————————————————————————————————————————————————————————————
 # DOMAIN-SPECIFIC TYPE DEFINITIONS
@@ -336,6 +341,7 @@ class _SubscriberBase(_ComponentBase):
                     self._queue.task_done()
         except Exception:
             self._running.clear()
+            logger.critical("fatal error in %s", type(self).__name__, exc_info=True)
             self._on_fatal()
 
     @abstractmethod
@@ -806,8 +812,10 @@ class StrategyBase(
         )
 
         # Default 0 so the first fill is handled as a fresh entry below.
-        old_position = self._position_sizes.get(event.symbol, 0)
-        old_avg_entry_price = self._average_entry_prices.get(event.symbol, 0)
+        old_position = self._position_sizes.get(event.symbol, PositionSize(0))
+        old_avg_entry_price = self._average_entry_prices.get(
+            event.symbol, ScaledPrice(0)
+        )
         new_position = old_position + signed_quantity
 
         # Flat: no position, no meaningful average entry price.
@@ -1426,6 +1434,7 @@ class _RunRecorder(_SubscriberBase):
         self._conn.commit()
 
     def _on_exception(self, exception: Exception) -> None:
+        logger.warning("rolling back transaction: %s", exception)
         if self._conn is not None:
             self._conn.rollback()
 
@@ -1472,7 +1481,11 @@ class RunOrchestrator:
         if self._instances.has_run_started:
             return
 
-        signal.signal(signal.SIGTERM, lambda sig, frame: self._shutdown_event.set())
+        def _handle_sigterm(sig: int, frame: typing.Any) -> None:
+            logger.info("SIGTERM received, shutting down")
+            self._shutdown_event.set()
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
         try:
             self._setup()
             self._shutdown_event.wait()
@@ -1483,11 +1496,15 @@ class RunOrchestrator:
         self._shutdown_event.set()
 
     def _setup(self) -> None:
+        self._run_id = RunId(
+            f"{time.strftime('%Y-%m-%d-%H-%M-%S')}_{uuid.uuid4().hex[:4]}"
+        )
         self._setup_event_bus()
         self._setup_run_recorder()
         self._setup_broker()
         self._setup_strategies()
         self._setup_datafeed()
+        logger.info("run started: %s", self._run_id)
 
     def _setup_event_bus(self) -> None:
         self._instances.event_bus = EventBus()
@@ -1497,7 +1514,7 @@ class RunOrchestrator:
         self._instances.run_recorder = _RunRecorder(
             self._instances.event_bus,
             self._runs_db_path,
-            RunId(f"{time.strftime('%Y-%m-%d-%H-%M-%S')}_{uuid.uuid4().hex[:4]}"),
+            self._run_id,
             self._strategies,
             on_fatal=self._shutdown_event.set,
         )
@@ -1537,23 +1554,29 @@ class RunOrchestrator:
                     self._instances.datafeed.unsubscribe(symbols, record_type)
                 self._instances.datafeed.disconnect()
             except Exception:
-                pass
+                logger.error("datafeed teardown failed", exc_info=True)
 
         for strategy in self._instances.strategies:
             try:
                 strategy.shutdown()
             except Exception:
-                pass
+                logger.error(
+                    "strategy teardown failed for %s",
+                    type(strategy).__name__,
+                    exc_info=True,
+                )
 
         if self._instances.broker is not None:
             try:
                 self._instances.broker.shutdown()
                 self._instances.broker.disconnect()
             except Exception:
-                pass
+                logger.error("broker teardown failed", exc_info=True)
 
         if self._instances.run_recorder is not None:
             try:
                 self._instances.run_recorder.shutdown()
             except Exception:
-                pass
+                logger.error("run recorder teardown failed", exc_info=True)
+
+        logger.info("teardown complete")
