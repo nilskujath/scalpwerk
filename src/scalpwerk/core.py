@@ -1,7 +1,3 @@
-# ——————————————————————————————————————————————————————————————————————————————————————
-# IMPORTS
-# ——————————————————————————————————————————————————————————————————————————————————————
-
 import abc
 import collections
 import dataclasses
@@ -16,24 +12,13 @@ import time
 import typing
 import uuid
 
-# ——————————————————————————————————————————————————————————————————————————————————————
-# LOGGING
-# ——————————————————————————————————————————————————————————————————————————————————————
-
-# No handlers configured; falls back to `logging.lastResort` (stderr, WARNING+).
-logger = logging.getLogger(__name__)
-
-
-# ——————————————————————————————————————————————————————————————————————————————————————
-# DOMAIN CONCEPTS
-# ——————————————————————————————————————————————————————————————————————————————————————
+logger = logging.getLogger(__name__)  # No handlers; falls back to `logging.lastResort`.
 
 
 class DomainConcepts:
     # fmt: off
 
-    # Domain concepts with effectively infinite value sets are implemented as
-    # `NewType` aliases.
+    # Concepts with effectively infinite value sets are implemented as type aliases.
     class Temporal:
         UnixNanoseconds = typing.NewType("UnixNanoseconds", int       )
 
@@ -46,8 +31,10 @@ class DomainConcepts:
         FilledQuantity  = typing.NewType("FilledQuantity",  int       )
         PositionSize    = typing.NewType("PositionSize",    int       )
 
-    class Descriptive:
+    class Analytic:
         IndicatorValue  = typing.NewType("IndicatorValue",  float     )
+
+    class Descriptive:
         IndicatorName   = typing.NewType("IndicatorName",   str       )
         Symbol          = typing.NewType("Symbol",          str       )
 
@@ -77,72 +64,66 @@ class DomainConcepts:
     # fmt: on
 
 
-# ——————————————————————————————————————————————————————————————————————————————————————
-# DOMAIN EVENTS
-# ——————————————————————————————————————————————————————————————————————————————————————
-
-
-class Events:
-    # fmt: off
-
-    # Properties (not plain attributes) because frozen dataclasses have read-only
-    # fields; plain Protocol attributes imply settable, which mypy rejects.
+class EventMessages:
     class Protocol(typing.Protocol):
-        @property
+        @property  # for `mypy`, plain attribute would imply settable.
         def occurred_at_ns(self) -> DomainConcepts.Temporal.UnixNanoseconds: ...
         @property
         def created_at_ns(self) -> DomainConcepts.Temporal.UnixNanoseconds: ...
 
-    # Namespace for events concerning market data coming into the system.
+    # fmt: off
     class MarketUpdate:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class OHLCV:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             symbol:            DomainConcepts.Descriptive.Symbol
             record_type:       typing.Literal[
                                    DomainConcepts.RecordType.OHLCV_1S,
                                    DomainConcepts.RecordType.OHLCV_1M,
                                    DomainConcepts.RecordType.OHLCV_1H,
                                    DomainConcepts.RecordType.OHLCV_1D,
-                               ]
+                               ] # Hedge against extension of `RecordType`.
+            
             open:              DomainConcepts.Monetary.ScaledPrice
             high:              DomainConcepts.Monetary.ScaledPrice
             low:               DomainConcepts.Monetary.ScaledPrice
             close:             DomainConcepts.Monetary.ScaledPrice
             volume:            DomainConcepts.Volumetric.Volume | None = None
 
-    # Namespace for events emitted by a strategy component.
     class StrategyUpdate:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class IndicatorUpdate:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             symbol:            DomainConcepts.Descriptive.Symbol
-            source_event:      "Events.MarketUpdate.OHLCV"
+            source_event: "EventMessages.MarketUpdate.OHLCV"  # `Events` not yet bound.
             indicator_values:  dict[
                                    DomainConcepts.Descriptive.IndicatorName,
-                                   DomainConcepts.Descriptive.IndicatorValue,
+                                   DomainConcepts.Analytic.IndicatorValue,
                                ]
 
-    # Namespace for events that require an action from the broker component.
     class BrokerRequest:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class SubmitOrder:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             symbol:            DomainConcepts.Descriptive.Symbol
             order_type:        DomainConcepts.OrderType
             side:              DomainConcepts.TradeSide
             quantity:          DomainConcepts.Volumetric.Quantity
-            limit_price: DomainConcepts.Monetary.ScaledPrice | None = None
-            stop_price: DomainConcepts.Monetary.ScaledPrice | None = None
+            limit_price:       DomainConcepts.Monetary.ScaledPrice | None = None
+            stop_price:        DomainConcepts.Monetary.ScaledPrice | None = None
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class ModifyOrder:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             symbol:            DomainConcepts.Descriptive.Symbol
             quantity:          DomainConcepts.Volumetric.Quantity
@@ -153,15 +134,16 @@ class Events:
         class CancelOrder:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             symbol:            DomainConcepts.Descriptive.Symbol
 
-    # Namespace for events that report an action from the broker component.
     class BrokerResponse:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class CancellationAccepted:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
 
@@ -169,6 +151,7 @@ class Events:
         class CancellationRejected:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
             reason:            str
@@ -177,6 +160,7 @@ class Events:
         class ModificationAccepted:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
 
@@ -184,6 +168,7 @@ class Events:
         class ModificationRejected:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
             reason:            str
@@ -192,6 +177,7 @@ class Events:
         class OrderAccepted:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
 
@@ -199,18 +185,19 @@ class Events:
         class OrderRejected:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             # Optional: rejection may arrive before the broker assigns an ID.
-            broker_order_id: DomainConcepts.Identifier.BrokerOrderId | None = None
+            broker_order_id:   DomainConcepts.Identifier.BrokerOrderId | None = None
             reason:            str
 
-        # A single execution against an order. Does not indicate partial
-        # vs. full fill; the system must track fill quantities to
-        # determine remaining open quantity.
+        # A single execution against an order. Does not indicate partial vs. full fill;
+        # the system must track fill quantities to determine remaining open quantity.
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class Fill:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
             symbol:            DomainConcepts.Descriptive.Symbol
@@ -220,9 +207,8 @@ class Events:
             filled_quantity:   DomainConcepts.Volumetric.Quantity
             fill_price:        DomainConcepts.Monetary.ScaledPrice
             exchange:          str
-            # Combined cost for this fill (broker, exchange, and
-            # regulatory fees); defaults to 0 if the broker does not
-            # report commission per fill.
+            # Combined cost for this fill (broker, exchange, and regulatory fees);
+            # defaults to 0 if the broker does not report commission per fill.
             commission:        DomainConcepts.Monetary.ScaledPrice = (
                                    DomainConcepts.Monetary.ScaledPrice(0)
                                )
@@ -231,6 +217,7 @@ class Events:
         class OrderExpired:
             occurred_at_ns:    DomainConcepts.Temporal.UnixNanoseconds
             created_at_ns:     DomainConcepts.Temporal.UnixNanoseconds
+            
             internal_order_id: DomainConcepts.Identifier.InternalOrderId
             broker_order_id:   DomainConcepts.Identifier.BrokerOrderId
     # fmt: on
@@ -246,7 +233,7 @@ class _SubscriberLike(typing.Protocol):
     def wait_until_idle(self) -> None: ...
     @property
     def is_idle(self) -> bool: ...
-    def receive(self, event: Events.Protocol) -> None: ...
+    def receive(self, event: EventMessages.Protocol) -> None: ...
 
 
 class EventBus:
@@ -254,14 +241,14 @@ class EventBus:
         # Using a set as the defaultdict's value avoids needing additional logic to
         # guard against duplicate subscriptions in the `add_event_subscription` method.
         self._per_event_subscriptions: collections.defaultdict[
-            type[Events.Protocol], set[_SubscriberLike]
+            type[EventMessages.Protocol], set[_SubscriberLike]
         ] = collections.defaultdict(set)
         # Each subscriber runs in its own thread. The Lock ensures that only one
         # subscriber thread at a time can access `_per_event_subscriptions`.
         self._lock: threading.Lock = threading.Lock()
 
     def add_event_subscription(
-        self, subscriber: _SubscriberLike, event_type: type[Events.Protocol]
+        self, subscriber: _SubscriberLike, event_type: type[EventMessages.Protocol]
     ) -> None:
         with self._lock:
             self._per_event_subscriptions[event_type].add(subscriber)
@@ -271,7 +258,7 @@ class EventBus:
             for subscriber_set in self._per_event_subscriptions.values():
                 subscriber_set.discard(subscriber)
 
-    def publish_event_to_system(self, event: Events.Protocol) -> None:
+    def publish_event_to_system(self, event: EventMessages.Protocol) -> None:
         # Copy under the Lock and iterate outside it so the Lock is held as briefly
         # as possible and concurrent publishes from other threads are not blocked.
         with self._lock:
@@ -318,7 +305,7 @@ class _SubscriberBase(_ComponentBase):
         super().__init__(event_bus)
         self._on_fatal = on_fatal
         # None acts as a poison pill that tells the event loop to shut down.
-        self._queue: queue.Queue[Events.Protocol | None] = queue.Queue()
+        self._queue: queue.Queue[EventMessages.Protocol | None] = queue.Queue()
         # Thread-safe flag (no Lock needed). Set before starting the thread so receive
         # can accept events immediately; otherwise they'd be silently dropped.
         self._running: threading.Event = threading.Event()
@@ -340,7 +327,7 @@ class _SubscriberBase(_ComponentBase):
             return True
         return self._queue.unfinished_tasks == 0
 
-    def receive(self, event: Events.Protocol) -> None:
+    def receive(self, event: EventMessages.Protocol) -> None:
         if self._running.is_set():
             self._queue.put(event)
 
@@ -356,7 +343,7 @@ class _SubscriberBase(_ComponentBase):
         if threading.current_thread() is not self._thread:
             self._thread.join()
 
-    def _subscribe_to_events(self, *event_types: type[Events.Protocol]):
+    def _subscribe_to_events(self, *event_types: type[EventMessages.Protocol]):
         for event_type in event_types:
             self._event_bus.add_event_subscription(self, event_type)
 
@@ -383,7 +370,7 @@ class _SubscriberBase(_ComponentBase):
             self._on_fatal()
 
     @abc.abstractmethod
-    def _on_event(self, event: Events.Protocol):
+    def _on_event(self, event: EventMessages.Protocol):
         pass
 
     @abc.abstractmethod
@@ -392,7 +379,9 @@ class _SubscriberBase(_ComponentBase):
 
 
 # Parameterizes `_EmitterBase` so each subclass must declare which event types it emits.
-_EmittableEventType = typing.TypeVar("_EmittableEventType", bound=Events.Protocol)
+_EmittableEventType = typing.TypeVar(
+    "_EmittableEventType", bound=EventMessages.Protocol
+)
 
 
 # Subclasses specify their allowed event types, e.g.
@@ -421,14 +410,14 @@ class BrokerBase(
     _ExternalComponentMixin,
     _SubscriberBase,
     _EmitterBase[
-        Events.BrokerResponse.OrderAccepted
-        | Events.BrokerResponse.OrderRejected
-        | Events.BrokerResponse.ModificationAccepted
-        | Events.BrokerResponse.ModificationRejected
-        | Events.BrokerResponse.CancellationAccepted
-        | Events.BrokerResponse.CancellationRejected
-        | Events.BrokerResponse.Fill
-        | Events.BrokerResponse.OrderExpired
+        EventMessages.BrokerResponse.OrderAccepted
+        | EventMessages.BrokerResponse.OrderRejected
+        | EventMessages.BrokerResponse.ModificationAccepted
+        | EventMessages.BrokerResponse.ModificationRejected
+        | EventMessages.BrokerResponse.CancellationAccepted
+        | EventMessages.BrokerResponse.CancellationRejected
+        | EventMessages.BrokerResponse.Fill
+        | EventMessages.BrokerResponse.OrderExpired
     ],
 ):
     def __init__(
@@ -439,36 +428,38 @@ class BrokerBase(
         super().__init__(event_bus, on_fatal=on_fatal)
 
         self._subscribe_to_events(
-            Events.BrokerRequest.SubmitOrder,
-            Events.BrokerRequest.ModifyOrder,
-            Events.BrokerRequest.CancelOrder,
+            EventMessages.BrokerRequest.SubmitOrder,
+            EventMessages.BrokerRequest.ModifyOrder,
+            EventMessages.BrokerRequest.CancelOrder,
         )
 
-    def _on_event(self, event: Events.Protocol) -> None:
+    def _on_event(self, event: EventMessages.Protocol) -> None:
         match event:
-            case Events.BrokerRequest.SubmitOrder() as submit_order_event:
+            case EventMessages.BrokerRequest.SubmitOrder() as submit_order_event:
                 self._on_submit_order(submit_order_event)
-            case Events.BrokerRequest.ModifyOrder() as modify_order_event:
+            case EventMessages.BrokerRequest.ModifyOrder() as modify_order_event:
                 self._on_modify_order(modify_order_event)
-            case Events.BrokerRequest.CancelOrder() as cancel_order_event:
+            case EventMessages.BrokerRequest.CancelOrder() as cancel_order_event:
                 self._on_cancel_order(cancel_order_event)
             case _:
                 return
 
     @abc.abstractmethod
-    def _on_submit_order(self, event: Events.BrokerRequest.SubmitOrder) -> None:
+    def _on_submit_order(self, event: EventMessages.BrokerRequest.SubmitOrder) -> None:
         pass
 
     @abc.abstractmethod
-    def _on_modify_order(self, event: Events.BrokerRequest.ModifyOrder) -> None:
+    def _on_modify_order(self, event: EventMessages.BrokerRequest.ModifyOrder) -> None:
         pass
 
     @abc.abstractmethod
-    def _on_cancel_order(self, event: Events.BrokerRequest.CancelOrder) -> None:
+    def _on_cancel_order(self, event: EventMessages.BrokerRequest.CancelOrder) -> None:
         pass
 
 
-class DatafeedBase(_ExternalComponentMixin, _EmitterBase[Events.MarketUpdate.OHLCV]):
+class DatafeedBase(
+    _ExternalComponentMixin, _EmitterBase[EventMessages.MarketUpdate.OHLCV]
+):
     def __init__(
         self,
         event_bus: EventBus,
@@ -505,7 +496,7 @@ class IndicatorBase(abc.ABC):
         # predictable since indicators only need a finite lookback window.
         self._history: dict[
             DomainConcepts.Descriptive.Symbol,
-            collections.deque[DomainConcepts.Descriptive.IndicatorValue],
+            collections.deque[DomainConcepts.Analytic.IndicatorValue],
         ] = {}
 
     # The name should be defined via an f-string so that instances of the same indicator
@@ -515,7 +506,7 @@ class IndicatorBase(abc.ABC):
     def name(self) -> DomainConcepts.Descriptive.IndicatorName:
         pass
 
-    def update(self, event: Events.MarketUpdate.OHLCV) -> None:
+    def update(self, event: EventMessages.MarketUpdate.OHLCV) -> None:
         value = self._compute(event)
         symbol = event.symbol
         if symbol not in self._history:
@@ -524,42 +515,42 @@ class IndicatorBase(abc.ABC):
 
     @abc.abstractmethod
     def _compute(
-        self, event: Events.MarketUpdate.OHLCV
-    ) -> DomainConcepts.Descriptive.IndicatorValue:
+        self, event: EventMessages.MarketUpdate.OHLCV
+    ) -> DomainConcepts.Analytic.IndicatorValue:
         pass
 
     def latest(
         self, symbol: DomainConcepts.Descriptive.Symbol
-    ) -> DomainConcepts.Descriptive.IndicatorValue:
+    ) -> DomainConcepts.Analytic.IndicatorValue:
         return self[symbol, -1]
 
     # Supports standard negative indexing, e.g. `indicator["AAPL", -2]`.
     def __getitem__(
         self, key: tuple[DomainConcepts.Descriptive.Symbol, int]
-    ) -> DomainConcepts.Descriptive.IndicatorValue:
+    ) -> DomainConcepts.Analytic.IndicatorValue:
         symbol, index = key
         history = self._history.get(symbol)
         if history is None:
-            return DomainConcepts.Descriptive.IndicatorValue(float("nan"))
+            return DomainConcepts.Analytic.IndicatorValue(float("nan"))
         try:
             return history[index]
         except IndexError:
-            return DomainConcepts.Descriptive.IndicatorValue(float("nan"))
+            return DomainConcepts.Analytic.IndicatorValue(float("nan"))
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _PendingOrder:
-    order: Events.BrokerRequest.SubmitOrder
+    order: EventMessages.BrokerRequest.SubmitOrder
     filled_quantity: DomainConcepts.Volumetric.FilledQuantity
 
 
 class StrategyBase(
     _SubscriberBase,
     _EmitterBase[
-        Events.BrokerRequest.SubmitOrder
-        | Events.BrokerRequest.ModifyOrder
-        | Events.BrokerRequest.CancelOrder
-        | Events.StrategyUpdate.IndicatorUpdate
+        EventMessages.BrokerRequest.SubmitOrder
+        | EventMessages.BrokerRequest.ModifyOrder
+        | EventMessages.BrokerRequest.CancelOrder
+        | EventMessages.StrategyUpdate.IndicatorUpdate
     ],
 ):
     def __init__(
@@ -575,15 +566,15 @@ class StrategyBase(
         self._record_type: DomainConcepts.RecordType = record_type
 
         self._subscribe_to_events(
-            Events.MarketUpdate.OHLCV,
-            Events.BrokerResponse.OrderAccepted,
-            Events.BrokerResponse.OrderRejected,
-            Events.BrokerResponse.ModificationAccepted,
-            Events.BrokerResponse.ModificationRejected,
-            Events.BrokerResponse.CancellationAccepted,
-            Events.BrokerResponse.CancellationRejected,
-            Events.BrokerResponse.Fill,
-            Events.BrokerResponse.OrderExpired,
+            EventMessages.MarketUpdate.OHLCV,
+            EventMessages.BrokerResponse.OrderAccepted,
+            EventMessages.BrokerResponse.OrderRejected,
+            EventMessages.BrokerResponse.ModificationAccepted,
+            EventMessages.BrokerResponse.ModificationRejected,
+            EventMessages.BrokerResponse.CancellationAccepted,
+            EventMessages.BrokerResponse.CancellationRejected,
+            EventMessages.BrokerResponse.Fill,
+            EventMessages.BrokerResponse.OrderExpired,
         )
 
         self._current_symbol: DomainConcepts.Descriptive.Symbol | None = None
@@ -597,15 +588,15 @@ class StrategyBase(
         # Orders move to `_pending_orders` on acceptance or are removed on rejection.
         self._submitted_orders: dict[
             DomainConcepts.Identifier.InternalOrderId,
-            Events.BrokerRequest.SubmitOrder,
+            EventMessages.BrokerRequest.SubmitOrder,
         ] = {}
         self._submitted_modifications: dict[
             DomainConcepts.Identifier.InternalOrderId,
-            Events.BrokerRequest.ModifyOrder,
+            EventMessages.BrokerRequest.ModifyOrder,
         ] = {}
         self._submitted_cancellations: dict[
             DomainConcepts.Identifier.InternalOrderId,
-            Events.BrokerRequest.CancelOrder,
+            EventMessages.BrokerRequest.CancelOrder,
         ] = {}
 
         # Tracks accepted orders and their cumulative filled quantity. Orders leave
@@ -639,31 +630,39 @@ class StrategyBase(
         # Returns indicator for inline assignment: `self.sma = self.add_indicator(...)`.
         return indicator
 
-    def _on_event(self, event: Events.Protocol) -> None:
+    def _on_event(self, event: EventMessages.Protocol) -> None:
         match event:
-            case Events.MarketUpdate.OHLCV() as ohlcv_event:
+            case EventMessages.MarketUpdate.OHLCV() as ohlcv_event:
                 self._on_market_update(ohlcv_event)
-            case Events.BrokerResponse.OrderAccepted() as order_accepted_event:
+            case EventMessages.BrokerResponse.OrderAccepted() as order_accepted_event:
                 self._on_order_accepted(order_accepted_event)
-            case Events.BrokerResponse.OrderRejected() as order_rejected_event:
+            case EventMessages.BrokerResponse.OrderRejected() as order_rejected_event:
                 self._on_order_rejected(order_rejected_event)
-            case Events.BrokerResponse.ModificationAccepted() as mod_accepted_event:
+            case (
+                EventMessages.BrokerResponse.ModificationAccepted() as mod_accepted_event
+            ):
                 self._on_modification_accepted(mod_accepted_event)
-            case Events.BrokerResponse.ModificationRejected() as mod_rejected_event:
+            case (
+                EventMessages.BrokerResponse.ModificationRejected() as mod_rejected_event
+            ):
                 self._on_modification_rejected(mod_rejected_event)
-            case Events.BrokerResponse.CancellationAccepted() as cancel_accepted_event:
+            case (
+                EventMessages.BrokerResponse.CancellationAccepted() as cancel_accepted_event
+            ):
                 self._on_cancellation_accepted(cancel_accepted_event)
-            case Events.BrokerResponse.CancellationRejected() as cancel_rejected_event:
+            case (
+                EventMessages.BrokerResponse.CancellationRejected() as cancel_rejected_event
+            ):
                 self._on_cancellation_rejected(cancel_rejected_event)
-            case Events.BrokerResponse.Fill() as fill_event:
+            case EventMessages.BrokerResponse.Fill() as fill_event:
                 self._on_fill(fill_event)
-            case Events.BrokerResponse.OrderExpired() as order_expired_event:
+            case EventMessages.BrokerResponse.OrderExpired() as order_expired_event:
                 self._on_order_expired(order_expired_event)
             case _:
                 return
 
     # Wraps the abstract `on_market_update` with internal plumbing.
-    def _on_market_update(self, event: Events.MarketUpdate.OHLCV) -> None:
+    def _on_market_update(self, event: EventMessages.MarketUpdate.OHLCV) -> None:
         self._current_symbol = event.symbol
         self._current_event_ns = event.occurred_at_ns
         for indicator in self._indicators.values():
@@ -673,10 +672,12 @@ class StrategyBase(
         self._emit_indicator_update(event)
 
     @abc.abstractmethod
-    def on_market_update(self, event: Events.MarketUpdate.OHLCV) -> None:
+    def on_market_update(self, event: EventMessages.MarketUpdate.OHLCV) -> None:
         pass
 
-    def _emit_indicator_update(self, source_event: Events.MarketUpdate.OHLCV) -> None:
+    def _emit_indicator_update(
+        self, source_event: EventMessages.MarketUpdate.OHLCV
+    ) -> None:
         if not self._indicators:
             return
 
@@ -689,7 +690,7 @@ class StrategyBase(
         }
 
         self._emit_event(
-            Events.StrategyUpdate.IndicatorUpdate(
+            EventMessages.StrategyUpdate.IndicatorUpdate(
                 occurred_at_ns=self._current_event_ns,
                 created_at_ns=self._current_event_ns,
                 symbol=self._current_symbol,
@@ -729,7 +730,7 @@ class StrategyBase(
 
         internal_order_id = DomainConcepts.Identifier.InternalOrderId(uuid.uuid4())
 
-        event = Events.BrokerRequest.SubmitOrder(
+        event = EventMessages.BrokerRequest.SubmitOrder(
             occurred_at_ns=self._current_event_ns,
             created_at_ns=self._current_event_ns,
             internal_order_id=internal_order_id,
@@ -759,7 +760,7 @@ class StrategyBase(
         if pending is None:
             return False
 
-        event = Events.BrokerRequest.ModifyOrder(
+        event = EventMessages.BrokerRequest.ModifyOrder(
             occurred_at_ns=self._current_event_ns,
             created_at_ns=self._current_event_ns,
             internal_order_id=internal_order_id,
@@ -783,7 +784,7 @@ class StrategyBase(
         if pending is None:
             return False
 
-        event = Events.BrokerRequest.CancelOrder(
+        event = EventMessages.BrokerRequest.CancelOrder(
             occurred_at_ns=self._current_event_ns,
             created_at_ns=self._current_event_ns,
             internal_order_id=internal_order_id,
@@ -796,24 +797,28 @@ class StrategyBase(
 
     # Broker implementations must emit OrderAccepted before any Fill for the same order,
     # otherwise fills would arrive before `_pending_orders` has the entry to update.
-    def _on_order_accepted(self, event: Events.BrokerResponse.OrderAccepted) -> None:
+    def _on_order_accepted(
+        self, event: EventMessages.BrokerResponse.OrderAccepted
+    ) -> None:
         order = self._submitted_orders.pop(event.internal_order_id, None)
         if order is not None:
             self._pending_orders[event.internal_order_id] = _PendingOrder(
                 order, DomainConcepts.Volumetric.FilledQuantity(0)
             )
 
-    def _on_order_rejected(self, event: Events.BrokerResponse.OrderRejected) -> None:
+    def _on_order_rejected(
+        self, event: EventMessages.BrokerResponse.OrderRejected
+    ) -> None:
         self._submitted_orders.pop(event.internal_order_id, None)
 
     def _on_modification_accepted(
-        self, event: Events.BrokerResponse.ModificationAccepted
+        self, event: EventMessages.BrokerResponse.ModificationAccepted
     ) -> None:
         modification = self._submitted_modifications.pop(event.internal_order_id, None)
         if modification is not None:
             pending = self._pending_orders.get(event.internal_order_id)
             if pending is not None:
-                updated_order = Events.BrokerRequest.SubmitOrder(
+                updated_order = EventMessages.BrokerRequest.SubmitOrder(
                     occurred_at_ns=pending.order.occurred_at_ns,
                     created_at_ns=pending.order.created_at_ns,
                     internal_order_id=pending.order.internal_order_id,
@@ -835,12 +840,12 @@ class StrategyBase(
                     )
 
     def _on_modification_rejected(
-        self, event: Events.BrokerResponse.ModificationRejected
+        self, event: EventMessages.BrokerResponse.ModificationRejected
     ) -> None:
         self._submitted_modifications.pop(event.internal_order_id, None)
 
     def _on_cancellation_accepted(
-        self, event: Events.BrokerResponse.CancellationAccepted
+        self, event: EventMessages.BrokerResponse.CancellationAccepted
     ) -> None:
         self._submitted_cancellations.pop(event.internal_order_id, None)
         self._pending_orders.pop(event.internal_order_id, None)
@@ -848,15 +853,15 @@ class StrategyBase(
         self._submitted_modifications.pop(event.internal_order_id, None)
 
     def _on_cancellation_rejected(
-        self, event: Events.BrokerResponse.CancellationRejected
+        self, event: EventMessages.BrokerResponse.CancellationRejected
     ) -> None:
         self._submitted_cancellations.pop(event.internal_order_id, None)
 
-    def _on_fill(self, event: Events.BrokerResponse.Fill) -> None:
+    def _on_fill(self, event: EventMessages.BrokerResponse.Fill) -> None:
         self._update_position_size_and_avg_entry_price(event)
         self._update_pending_orders(event)
 
-    def _update_pending_orders(self, event: Events.BrokerResponse.Fill) -> None:
+    def _update_pending_orders(self, event: EventMessages.BrokerResponse.Fill) -> None:
         pending = self._pending_orders.get(event.internal_order_id)
         # The order may already be gone (prior fill, cancellation, or expiry).
         if pending is None:
@@ -872,7 +877,7 @@ class StrategyBase(
             )
 
     def _update_position_size_and_avg_entry_price(
-        self, event: Events.BrokerResponse.Fill
+        self, event: EventMessages.BrokerResponse.Fill
     ) -> None:
         signed_quantity = (
             event.filled_quantity
@@ -919,7 +924,9 @@ class StrategyBase(
             new_avg_entry_price
         )
 
-    def _on_order_expired(self, event: Events.BrokerResponse.OrderExpired) -> None:
+    def _on_order_expired(
+        self, event: EventMessages.BrokerResponse.OrderExpired
+    ) -> None:
         self._pending_orders.pop(event.internal_order_id, None)
         # The order is dead, so any in-flight modification or cancellation will never
         # get a response. Clean up to prevent leaks.
@@ -1233,18 +1240,18 @@ class _RunRecorder(_SubscriberBase):
         self._conn: sqlite3.Connection | None = None
 
         self._subscribe_to_events(
-            Events.StrategyUpdate.IndicatorUpdate,
-            Events.BrokerRequest.SubmitOrder,
-            Events.BrokerRequest.ModifyOrder,
-            Events.BrokerRequest.CancelOrder,
-            Events.BrokerResponse.OrderAccepted,
-            Events.BrokerResponse.OrderRejected,
-            Events.BrokerResponse.ModificationAccepted,
-            Events.BrokerResponse.ModificationRejected,
-            Events.BrokerResponse.CancellationAccepted,
-            Events.BrokerResponse.CancellationRejected,
-            Events.BrokerResponse.Fill,
-            Events.BrokerResponse.OrderExpired,
+            EventMessages.StrategyUpdate.IndicatorUpdate,
+            EventMessages.BrokerRequest.SubmitOrder,
+            EventMessages.BrokerRequest.ModifyOrder,
+            EventMessages.BrokerRequest.CancelOrder,
+            EventMessages.BrokerResponse.OrderAccepted,
+            EventMessages.BrokerResponse.OrderRejected,
+            EventMessages.BrokerResponse.ModificationAccepted,
+            EventMessages.BrokerResponse.ModificationRejected,
+            EventMessages.BrokerResponse.CancellationAccepted,
+            EventMessages.BrokerResponse.CancellationRejected,
+            EventMessages.BrokerResponse.Fill,
+            EventMessages.BrokerResponse.OrderExpired,
         )
 
     def _setup_db(self) -> None:
@@ -1288,11 +1295,11 @@ class _RunRecorder(_SubscriberBase):
             if self._conn is not None:
                 self._conn.close()
 
-    def _on_event(self, event: Events.Protocol) -> None:
+    def _on_event(self, event: EventMessages.Protocol) -> None:
         assert self._conn is not None  # For type checker; always set by _setup_db
 
         match event:
-            case Events.StrategyUpdate.IndicatorUpdate() as e:
+            case EventMessages.StrategyUpdate.IndicatorUpdate() as e:
                 src = e.source_event
                 self._conn.execute(
                     self._SQL_INSERT_OHLCV,
@@ -1324,7 +1331,7 @@ class _RunRecorder(_SubscriberBase):
                     ],
                 )
 
-            case Events.BrokerRequest.SubmitOrder() as e:
+            case EventMessages.BrokerRequest.SubmitOrder() as e:
                 self._conn.execute(
                     self._SQL_INSERT_SUBMIT_ORDER,
                     (
@@ -1341,7 +1348,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerRequest.ModifyOrder() as e:
+            case EventMessages.BrokerRequest.ModifyOrder() as e:
                 self._conn.execute(
                     self._SQL_INSERT_MODIFY_ORDER,
                     (
@@ -1356,7 +1363,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerRequest.CancelOrder() as e:
+            case EventMessages.BrokerRequest.CancelOrder() as e:
                 self._conn.execute(
                     self._SQL_INSERT_CANCEL_ORDER,
                     (
@@ -1368,7 +1375,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.OrderAccepted() as e:
+            case EventMessages.BrokerResponse.OrderAccepted() as e:
                 self._conn.execute(
                     self._SQL_INSERT_ORDER_ACCEPTED,
                     (
@@ -1380,7 +1387,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.OrderRejected() as e:
+            case EventMessages.BrokerResponse.OrderRejected() as e:
                 self._conn.execute(
                     self._SQL_INSERT_ORDER_REJECTED,
                     (
@@ -1397,7 +1404,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.ModificationAccepted() as e:
+            case EventMessages.BrokerResponse.ModificationAccepted() as e:
                 self._conn.execute(
                     self._SQL_INSERT_MODIFICATION_ACCEPTED,
                     (
@@ -1409,7 +1416,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.ModificationRejected() as e:
+            case EventMessages.BrokerResponse.ModificationRejected() as e:
                 self._conn.execute(
                     self._SQL_INSERT_MODIFICATION_REJECTED,
                     (
@@ -1422,7 +1429,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.CancellationAccepted() as e:
+            case EventMessages.BrokerResponse.CancellationAccepted() as e:
                 self._conn.execute(
                     self._SQL_INSERT_CANCELLATION_ACCEPTED,
                     (
@@ -1434,7 +1441,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.CancellationRejected() as e:
+            case EventMessages.BrokerResponse.CancellationRejected() as e:
                 self._conn.execute(
                     self._SQL_INSERT_CANCELLATION_REJECTED,
                     (
@@ -1447,7 +1454,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.Fill() as e:
+            case EventMessages.BrokerResponse.Fill() as e:
                 self._conn.execute(
                     self._SQL_INSERT_FILL,
                     (
@@ -1467,7 +1474,7 @@ class _RunRecorder(_SubscriberBase):
                     ),
                 )
 
-            case Events.BrokerResponse.OrderExpired() as e:
+            case EventMessages.BrokerResponse.OrderExpired() as e:
                 self._conn.execute(
                     self._SQL_INSERT_ORDER_EXPIRED,
                     (
