@@ -26,6 +26,9 @@ version_toml = ["pyproject.toml:project.version"]
 branch = "master"
 build_command = "poetry build"
 
+[tool.black]
+target-version = ["py312"]
+
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
