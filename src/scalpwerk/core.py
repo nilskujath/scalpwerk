@@ -34,7 +34,27 @@ class Enums:  # enums to model domain concepts with a fixed set of possible valu
         OHLCV_1M = enum.auto()
         OHLCV_1H = enum.auto()
         OHLCV_1D = enum.auto()
+
+    class TimeInForce(enum.Enum):
+        DAY = enum.auto()
+        GTC = enum.auto()
+        IOC = enum.auto()
     # fmt: on
+
+
+class Exposure:
+    class WorkingOrder(typing.NamedTuple):
+        symbol: str
+        order_type: Enums.OrderType
+        side: Enums.TradeSide
+        quantity: int
+        limit_price: Types.ScaledPrice | None
+        stop_price: Types.ScaledPrice | None
+        filled_quantity: int
+
+    class Position(typing.NamedTuple):
+        size: int
+        cost_basis: Types.ScaledPrice
 
 
 class _Protocols:
@@ -56,17 +76,17 @@ class Events:
     class Datafeed:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class Bar:
-            occurred_at_ns:     Types.UnixNanoseconds
-            created_at_ns:      Types.UnixNanoseconds = dataclasses.field(
-                                    default_factory= lambda: Types.UnixNanoseconds(
-                                        time.time_ns()))
-            symbol:             str
-            record_type:        Enums.BarPeriod
-            open:               Types.ScaledPrice
-            high:               Types.ScaledPrice
-            low:                Types.ScaledPrice
-            close:              Types.ScaledPrice
-            volume:             int | None = None
+            occurred_at_ns: Types.UnixNanoseconds
+            created_at_ns:  Types.UnixNanoseconds = dataclasses.field(
+                                default_factory= lambda: Types.UnixNanoseconds(
+                                    time.time_ns()))
+            symbol:         str
+            record_type:    Enums.BarPeriod
+            open:           Types.ScaledPrice
+            high:           Types.ScaledPrice
+            low:            Types.ScaledPrice
+            close:          Types.ScaledPrice
+            volume:         int | None = None
 
     class Strategy:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
@@ -85,14 +105,15 @@ class Events:
             created_at_ns:      Types.UnixNanoseconds = dataclasses.field(
                                     default_factory= lambda: Types.UnixNanoseconds(
                                         time.time_ns()))
-            internal_order_id:  uuid.UUID
             symbol:             str
+            internal_order_id:  uuid.UUID
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class SubmitOrder(_OrderBase):
             order_type:         Enums.OrderType
             side:               Enums.TradeSide
             quantity:           int
+            time_in_force:      Enums.TimeInForce = Enums.TimeInForce.DAY
             limit_price:        Types.ScaledPrice | None = None
             stop_price:         Types.ScaledPrice | None = None
 
@@ -109,36 +130,28 @@ class Events:
     class Broker:
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class ExposureSnapshot:
-            occurred_at_ns:     Types.UnixNanoseconds
-            created_at_ns:      Types.UnixNanoseconds = dataclasses.field(
-                                    default_factory= lambda: Types.UnixNanoseconds(
-                                        time.time_ns()))
-            working_orders:     dict[uuid.UUID, "Exposure.WorkingOrder"]
-            positions:          dict[str, "Exposure.Position"]
+            occurred_at_ns:         Types.UnixNanoseconds
+            created_at_ns:          Types.UnixNanoseconds = dataclasses.field(
+                                        default_factory= lambda: Types.UnixNanoseconds(
+                                            time.time_ns()))
+            working_orders:         dict[uuid.UUID, Exposure.WorkingOrder]
+            positions:              dict[str, Exposure.Position]
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class _OrderBase:
-            occurred_at_ns:     Types.UnixNanoseconds
-            created_at_ns:      Types.UnixNanoseconds = dataclasses.field(
-                                    default_factory= lambda: Types.UnixNanoseconds(
-                                        time.time_ns()))
-            internal_order_id:  uuid.UUID
-            broker_order_id:    str
+            occurred_at_ns:         Types.UnixNanoseconds
+            created_at_ns:          Types.UnixNanoseconds = dataclasses.field(
+                                        default_factory= lambda: Types.UnixNanoseconds(
+                                            time.time_ns()))
+            internal_order_id:      uuid.UUID
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class OrderAccepted(_OrderBase):
             pass
 
-        # No inheritance from `_OrderBase` since `broker_order_id` can be `None`.
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
-        class OrderRejected:
-            occurred_at_ns:     Types.UnixNanoseconds
-            created_at_ns:      Types.UnixNanoseconds = dataclasses.field(
-                                    default_factory= lambda: Types.UnixNanoseconds(
-                                        time.time_ns()))
-            internal_order_id:  uuid.UUID
-            broker_order_id:    str | None = None
-            reason:             str = ""
+        class OrderRejected(_OrderBase):
+            reason:                 str = ""
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class CancellationAccepted(_OrderBase):
@@ -146,7 +159,7 @@ class Events:
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class CancellationRejected(_OrderBase):
-            reason:             str
+            reason:                 str
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class ModificationAccepted(_OrderBase):
@@ -154,20 +167,17 @@ class Events:
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class ModificationRejected(_OrderBase):
-            reason:             str
+            reason:                 str
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class Fill(_OrderBase):
-            symbol:             str  # needed for position bookkeeping
-            internal_fill_id:   uuid.UUID
-            broker_fill_id:     str
-            side:               Enums.TradeSide
-            filled_quantity:    int
-            fill_price:         Types.ScaledPrice
-            position_size:      int
-            position_avg_price: Types.ScaledPrice
-            exchange:           str
-            commission:         Types.ScaledPrice = Types.ScaledPrice(0)
+            symbol:                 str  # needed for position bookkeeping
+            internal_fill_id:       uuid.UUID
+            side:                   Enums.TradeSide
+            filled_quantity:        int
+            fill_price:             Types.ScaledPrice
+            position_size:          int
+            position_cost_basis:    Types.ScaledPrice
 
         @dataclasses.dataclass(kw_only=True, frozen=True, slots=True)
         class OrderExpired(_OrderBase):
@@ -263,21 +273,6 @@ class _Connectable(abc.ABC):
         pass
 
 
-class Exposure:
-    class WorkingOrder(typing.NamedTuple):
-        symbol: str
-        order_type: Enums.OrderType
-        side: Enums.TradeSide
-        quantity: int
-        limit_price: Types.ScaledPrice | None
-        stop_price: Types.ScaledPrice | None
-        filled_quantity: int
-
-    class Position(typing.NamedTuple):
-        size: int
-        avg_price: Types.ScaledPrice
-
-
 class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
     SUBSCRIBE_TO = (
         Events.Strategy.SubmitOrder,
@@ -321,9 +316,7 @@ class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
     @abc.abstractmethod
     def _get_exposure_snapshot(
         self,
-    ) -> tuple[
-        dict[uuid.UUID, "Exposure.WorkingOrder"], dict[str, "Exposure.Position"]
-    ]:
+    ) -> tuple[dict[uuid.UUID, Exposure.WorkingOrder], dict[str, Exposure.Position]]:
         pass
 
     @abc.abstractmethod
@@ -370,6 +363,7 @@ class IndicatorBase(abc.ABC):
             str,
             collections.deque[float],
         ] = {}
+        self._input_indicators: dict[str, "IndicatorBase"] = {}
 
     # The name should be defined via an f-string so that instances of the same indicator
     # can be distinguished via their parameters, e.g. `f"SMA_{period}_{source}"`
@@ -378,7 +372,13 @@ class IndicatorBase(abc.ABC):
     def name(self) -> str:
         pass
 
+    def add_indicator(self, indicator: "IndicatorBase") -> "IndicatorBase":
+        self._input_indicators[indicator.name] = indicator
+        return indicator
+
     def update(self, event: Events.Datafeed.Bar) -> None:
+        for input_indicator in self._input_indicators.values():
+            input_indicator.update(event)
         value = self._compute(event)
         symbol = event.symbol
         if symbol not in self._history:
@@ -456,6 +456,7 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         order_type: Enums.OrderType,
         side: Enums.TradeSide,
         quantity: int,
+        time_in_force: Enums.TimeInForce = Enums.TimeInForce.DAY,
         limit_price: Types.ScaledPrice | None = None,
         stop_price: Types.ScaledPrice | None = None,
     ) -> uuid.UUID:
@@ -468,6 +469,7 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
             order_type=order_type,
             side=side,
             quantity=quantity,
+            time_in_force=time_in_force,
             limit_price=limit_price,
             stop_price=stop_price,
         )
@@ -527,10 +529,10 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         return self.position_size == 0
 
     @property
-    def average_entry_price(self) -> Types.ScaledPrice | None:
+    def cost_basis(self) -> Types.ScaledPrice | None:
         assert self._current_bar is not None
         position = self._positions.get(self._current_bar.symbol)
-        return position.avg_price if position else None
+        return position.cost_basis if position else None
 
     def _on_event(self, event: _Protocols.EventLike) -> None:
         # fmt: off
@@ -666,7 +668,7 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
             self._positions.pop(fill.symbol, None)
         else:
             self._positions[fill.symbol] = Exposure.Position(
-                fill.position_size, fill.position_avg_price
+                fill.position_size, fill.position_cost_basis
             )
 
         working_order = self._working_orders.get(fill.internal_order_id)
@@ -703,6 +705,8 @@ class RunRecorderBase(_SubscriberBase, abc.ABC):
     )
 
 
+# Broker must connect before datafeed. Strategies receive ExposureSnapshot and any
+# subsequent broker events (fills, expirations) via FIFO before the first bar arrives.
 class OrchestratorBase(abc.ABC):
     def __init__(
         self,
