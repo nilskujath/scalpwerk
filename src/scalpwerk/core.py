@@ -2,14 +2,12 @@ import abc
 import collections
 import dataclasses
 import enum
-import logging
 import queue
+import signal
 import threading
 import time
 import typing
 import uuid
-
-logger = logging.getLogger(__name__)  # no handlers; falls back to `logging.lastResort`
 
 
 class Types:  # aliases for types with non-obvious semantics
@@ -205,6 +203,7 @@ class _EventBus:
             subscriber.receive(event)
 
 
+# Singleton for simplicity; trade-off: cannot run two isolated systems in same process.
 _event_bus = _EventBus()
 
 
@@ -264,6 +263,14 @@ class _EmitterBase:
 
 
 class _Connectable(abc.ABC):
+    # Set by the orchestrator. Subclasses call `self.trigger_shutdown()` to
+    # shut down the entire system (e.g. end of CSV, lost broker connection).
+    _shutdown_flag: threading.Event | None = None
+
+    def trigger_shutdown(self) -> None:
+        if self._shutdown_flag is not None:
+            self._shutdown_flag.set()
+
     @abc.abstractmethod
     def connect(self) -> None:
         pass
@@ -274,6 +281,7 @@ class _Connectable(abc.ABC):
 
 
 class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
+    # Every type listed here must have a matching case in `_on_event`.
     SUBSCRIBE_TO = (
         Events.Strategy.SubmitOrder,
         Events.Strategy.ModifyOrder,
@@ -292,7 +300,8 @@ class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
         )
 
     def disconnect(self) -> None:
-        self._disconnect()
+        self._disconnect()  # close connection
+        self.shutdown()  # stop event thread
 
     def _on_event(self, event: _Protocols.EventLike) -> None:
         match event:
@@ -303,7 +312,7 @@ class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
             case Events.Strategy.CancelOrder() as incoming_event:
                 self._on_cancel_order(incoming_event)
             case _:
-                return
+                raise RuntimeError(f"unhandled event type: {type(event).__name__}")
 
     @abc.abstractmethod
     def _connect(self) -> None:
@@ -405,6 +414,7 @@ class IndicatorBase(abc.ABC):
 
 
 class StrategyBase(_SubscriberBase, _EmitterBase):
+    # Every type listed here must have a matching case in `_on_event`.
     SUBSCRIBE_TO = (
         Events.Datafeed.Bar,
         Events.Broker.ExposureSnapshot,
@@ -460,7 +470,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         limit_price: Types.ScaledPrice | None = None,
         stop_price: Types.ScaledPrice | None = None,
     ) -> uuid.UUID:
-        assert self._current_bar is not None
+        if self._current_bar is None:
+            raise RuntimeError("no bar received yet")
         internal_order_id = uuid.uuid4()
         order_submission_event = Events.Strategy.SubmitOrder(
             occurred_at_ns=self._current_bar.occurred_at_ns,
@@ -484,7 +495,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         limit_price: Types.ScaledPrice | None = None,
         stop_price: Types.ScaledPrice | None = None,
     ) -> None:
-        assert self._current_bar is not None
+        if self._current_bar is None:
+            raise RuntimeError("no bar received yet")
         current_working_order = self._working_orders[internal_order_id]
         event = Events.Strategy.ModifyOrder(
             occurred_at_ns=self._current_bar.occurred_at_ns,
@@ -508,7 +520,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         self._emit_event(event)
 
     def submit_cancellation(self, internal_order_id: uuid.UUID) -> None:
-        assert self._current_bar is not None
+        if self._current_bar is None:
+            raise RuntimeError("no bar received yet")
         current_working_order = self._working_orders[internal_order_id]
         event = Events.Strategy.CancelOrder(
             occurred_at_ns=self._current_bar.occurred_at_ns,
@@ -520,7 +533,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
 
     @property
     def position_size(self) -> int:
-        assert self._current_bar is not None
+        if self._current_bar is None:
+            raise RuntimeError("no bar received yet")
         position = self._positions.get(self._current_bar.symbol)
         return position.size if position else 0
 
@@ -530,7 +544,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
 
     @property
     def cost_basis(self) -> Types.ScaledPrice | None:
-        assert self._current_bar is not None
+        if self._current_bar is None:
+            raise RuntimeError("no bar received yet")
         position = self._positions.get(self._current_bar.symbol)
         return position.cost_basis if position else None
 
@@ -566,6 +581,9 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
 
             case Events.Broker.OrderExpired()           as event:
                 self._on_order_expired(event)
+
+            case _:
+                raise RuntimeError(f"unhandled event type: {type(event).__name__}")
         # fmt: on
 
     def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
@@ -606,13 +624,13 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
     def _on_order_accepted(self, accepted_order: Events.Broker.OrderAccepted) -> None:
         order = self._submitted_orders.pop(accepted_order.internal_order_id)
         self._working_orders[accepted_order.internal_order_id] = Exposure.WorkingOrder(
-            order.symbol,
-            order.order_type,
-            order.side,
-            order.quantity,
-            order.limit_price,
-            order.stop_price,
-            int(0),
+            symbol=order.symbol,
+            order_type=order.order_type,
+            side=order.side,
+            quantity=order.quantity,
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+            filled_quantity=0,
         )
 
     def _on_order_rejected(self, rejected_order: Events.Broker.OrderRejected) -> None:
@@ -705,23 +723,63 @@ class RunRecorderBase(_SubscriberBase, abc.ABC):
     )
 
 
-# Broker must connect before datafeed. Strategies receive ExposureSnapshot and any
-# subsequent broker events (fills, expirations) via FIFO before the first bar arrives.
-class OrchestratorBase(abc.ABC):
+class Orchestrator:
     def __init__(
         self,
-        strategies: list[type[StrategyBase]],
+        strategy_classes: list[type[StrategyBase]],
         broker: type[BrokerConnectorBase],
         datafeed: type[DatafeedConnectorBase],
         recorder: RunRecorderBase | None = None,
     ) -> None:
-        self._strategies = strategies
-        self._broker_class = broker
-        self._datafeed_class = datafeed
-        self._recorder = recorder
+        self._strategy_instances = [cls() for cls in strategy_classes]
+        self._broker_instance = broker()
+        self._datafeed_instance = datafeed()
+        self._recorder_instance = recorder
+        self._shutdown_flag = threading.Event()
 
-    @abc.abstractmethod
-    def run(self) -> None: ...
+    def run(self) -> None:
+        # SIGTERM handler requires a (signal, frame) signature, but we only
+        # need to set the shutdown flag. The lambda adapts the two-arg call.
+        signal.signal(signal.SIGTERM, lambda sig, frame: self._shutdown_flag.set())
 
-    @abc.abstractmethod
-    def stop(self) -> None: ...
+        try:
+            # Broker is connected first so strategies receive the `ExposureSnapshot` and
+            # eventual subseq. fills before starting to trade on received market data.
+            # Direct access to _shutdown_flag is intentional: the orchestrator
+            # owns the flag and the connectors, so a setter adds nothing.
+            self._broker_instance._shutdown_flag = self._shutdown_flag
+            self._broker_instance.connect()
+
+            self._datafeed_instance._shutdown_flag = self._shutdown_flag
+            self._datafeed_instance.connect()
+
+            for strategy in self._strategy_instances:
+                self._datafeed_instance.subscribe(
+                    list(strategy.SYMBOLS), strategy.RECORD_TYPE
+                )
+
+            self._shutdown_flag.wait()
+
+        finally:
+            # Each step is guarded so one failure doesn't skip the rest.
+            for strategy in self._strategy_instances:
+                try:
+                    strategy.shutdown()
+                except Exception:
+                    pass
+
+            try:
+                self._datafeed_instance.disconnect()
+            except Exception:
+                pass
+
+            try:
+                self._broker_instance.disconnect()
+            except Exception:
+                pass
+
+            if self._recorder_instance is not None:
+                try:
+                    self._recorder_instance.shutdown()
+                except Exception:
+                    pass
