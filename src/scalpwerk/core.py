@@ -705,7 +705,7 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         self._submitted_cancellations.pop(expired_order.internal_order_id, None)
 
 
-class RunRecorderBase(_SubscriberBase, abc.ABC):
+class RecorderBase(_SubscriberBase, abc.ABC):
     SUBSCRIBE_TO = (
         Events.Strategy.IndicatorUpdate,
         Events.Strategy.SubmitOrder,
@@ -729,12 +729,12 @@ class Orchestrator:
         strategy_classes: list[type[StrategyBase]],
         broker: type[BrokerConnectorBase],
         datafeed: type[DatafeedConnectorBase],
-        recorder: RunRecorderBase | None = None,
+        recorders: list[type[RecorderBase]] | None = None,
     ) -> None:
         self._strategy_instances = [cls() for cls in strategy_classes]
         self._broker_instance = broker()
         self._datafeed_instance = datafeed()
-        self._recorder_instance = recorder
+        self._recorder_instances = [cls() for cls in recorders] if recorders else []
         self._shutdown_flag = threading.Event()
 
     def run(self) -> None:
@@ -778,8 +778,8 @@ class Orchestrator:
             except Exception:
                 pass
 
-            if self._recorder_instance is not None:
+            for recorder in self._recorder_instances:
                 try:
-                    self._recorder_instance.shutdown()
+                    recorder.shutdown()
                 except Exception:
                     pass
