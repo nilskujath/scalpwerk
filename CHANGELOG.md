@@ -2,6 +2,40 @@
 
 <!-- version list -->
 
+## v1.8.0 (2026-05-07)
+
+### Features
+
+- CSVDatafeedConnector, wait_until_system_idle, subscribe-before-connect
+  ([`71dfe84`](https://github.com/nilskujath/scalpwerk/commit/71dfe84455b448794667a08bce6c2a7eebe36461))
+
+### Refactoring
+
+- Clean up domain model and event comments
+  ([`3fbc82d`](https://github.com/nilskujath/scalpwerk/commit/3fbc82d9d6e7095ff69a389761c5b8acf8ccec03))
+
+- Concrete Orchestrator, trigger_shutdown, defensive runtime checks
+  ([`25729e4`](https://github.com/nilskujath/scalpwerk/commit/25729e440415f9d47a18a83ec6d578e8d20296d5))
+
+- Event hierarchy, default factory, strategy class variables
+  ([`2d9fd4b`](https://github.com/nilskujath/scalpwerk/commit/2d9fd4b1ef66fda21984a571bc96a959e501930a))
+
+- Major architecture overhaul of core.py
+  ([`5b48da2`](https://github.com/nilskujath/scalpwerk/commit/5b48da20256e49fa177028efeebbb0d0589895f5))
+
+- Multiple recorders, SQLiteRecorder, drop logging
+  ([`d262f5a`](https://github.com/nilskujath/scalpwerk/commit/d262f5aaf5b71ccfe11ed4192c6335337217cc0e))
+
+- Restructure domain model
+  ([`314293f`](https://github.com/nilskujath/scalpwerk/commit/314293f4e01aaef4ecfc6bf997dd2610a3ec6c18))
+
+- Simplify broker events, add TimeInForce, use cost basis
+  ([`f785e5f`](https://github.com/nilskujath/scalpwerk/commit/f785e5f4daf116ee81e5b298c3914a3cba8a66dd))
+
+- Streamline core architecture and extract recorder/orchestrator bases
+  ([`6176535`](https://github.com/nilskujath/scalpwerk/commit/6176535785b2a0cc528c3086fca194853a073f6c))
+
+
 ## v1.7.0 (2026-04-04)
 
 ### Features
