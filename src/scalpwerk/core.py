@@ -202,6 +202,18 @@ class _EventBus:
         for subscriber in self._per_event_subscriptions[type(event)]:
             subscriber.receive(event)
 
+    # Lives here because the event bus is the only component with the full
+    # subscriber registry. No other component can answer "is the system idle?"
+    def wait_until_system_idle(self) -> None:
+        # A single pass is insufficient because processing can publish new events
+        # into already-drained queues, so we loop until a re-check confirms idleness.
+        while True:
+            subscribers = set().union(*self._per_event_subscriptions.values())
+            for subscriber in subscribers:
+                subscriber.wait_until_idle()
+            if all(subscriber.is_idle for subscriber in subscribers):
+                break
+
 
 # Singleton for simplicity; trade-off: cannot run two isolated systems in same process.
 _event_bus = _EventBus()
@@ -260,6 +272,10 @@ class _EmitterBase:
     @staticmethod
     def _emit_event(event: _Protocols.EventLike) -> None:
         _event_bus.publish(event)
+
+    @staticmethod
+    def _wait_until_system_idle() -> None:
+        _event_bus.wait_until_system_idle()
 
 
 class _Connectable(abc.ABC):
@@ -743,20 +759,23 @@ class Orchestrator:
         signal.signal(signal.SIGTERM, lambda sig, frame: self._shutdown_flag.set())
 
         try:
-            # Broker is connected first so strategies receive the `ExposureSnapshot` and
-            # eventual subseq. fills before starting to trade on received market data.
             # Direct access to _shutdown_flag is intentional: the orchestrator
             # owns the flag and the connectors, so a setter adds nothing.
+
+            # Broker connects first so strategies receive the `ExposureSnapshot`
+            # and eventual subseq. fills before trading on received market data.
             self._broker_instance._shutdown_flag = self._shutdown_flag
             self._broker_instance.connect()
 
+            # Subscribe before connect: subscriptions are configuration,
+            # connect starts streaming. This guarantees all subscriptions
+            # are set before the first row is read.
             self._datafeed_instance._shutdown_flag = self._shutdown_flag
-            self._datafeed_instance.connect()
-
             for strategy in self._strategy_instances:
                 self._datafeed_instance.subscribe(
                     list(strategy.SYMBOLS), strategy.RECORD_TYPE
                 )
+            self._datafeed_instance.connect()
 
             self._shutdown_flag.wait()
 
