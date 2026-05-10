@@ -10,6 +10,10 @@ import typing
 import uuid
 
 
+class Constants:
+    PRICE_SCALE: int = 1_000_000_000
+
+
 class Types:  # aliases for types with non-obvious semantics
     UnixNanoseconds = typing.NewType("UnixNanoseconds", int)  # since UTC unix epoch
     ScaledPrice = typing.NewType("ScaledPrice", int)  # decimal prices scaled by 10^9
@@ -42,10 +46,12 @@ class Enums:  # enums to model domain concepts with a fixed set of possible valu
 
 class Exposure:
     class WorkingOrder(typing.NamedTuple):
+        internal_order_id: uuid.UUID
         symbol: str
         order_type: Enums.OrderType
         side: Enums.TradeSide
         quantity: int
+        time_in_force: Enums.TimeInForce
         limit_price: Types.ScaledPrice | None
         stop_price: Types.ScaledPrice | None
         filled_quantity: int
@@ -298,7 +304,7 @@ class _Connectable(abc.ABC):
 
 class BrokerConnectorBase(_Connectable, _SubscriberBase, _EmitterBase):
     # Every type listed here must have a matching case in `_on_event`.
-    SUBSCRIBE_TO = (
+    SUBSCRIBE_TO: tuple[type[_Protocols.EventLike], ...] = (
         Events.Strategy.SubmitOrder,
         Events.Strategy.ModifyOrder,
         Events.Strategy.CancelOrder,
@@ -640,10 +646,12 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
     def _on_order_accepted(self, accepted_order: Events.Broker.OrderAccepted) -> None:
         order = self._submitted_orders.pop(accepted_order.internal_order_id)
         self._working_orders[accepted_order.internal_order_id] = Exposure.WorkingOrder(
+            internal_order_id=accepted_order.internal_order_id,
             symbol=order.symbol,
             order_type=order.order_type,
             side=order.side,
             quantity=order.quantity,
+            time_in_force=order.time_in_force,
             limit_price=order.limit_price,
             stop_price=order.stop_price,
             filled_quantity=0,

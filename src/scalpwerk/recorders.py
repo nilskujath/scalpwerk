@@ -11,7 +11,7 @@ from .core import (
 class SQLiteRecorder(RecorderBase):
     DB_PATH: pathlib.Path = pathlib.Path("runs.db")
 
-    _SCHEMA_VERSION = 4
+    _SCHEMA_VERSION = 5
 
     _SCHEMA = """
         CREATE TABLE IF NOT EXISTS runs (
@@ -95,6 +95,7 @@ class SQLiteRecorder(RecorderBase):
             order_type        TEXT    NOT NULL,
             side              TEXT    NOT NULL,
             quantity          INTEGER NOT NULL,
+            time_in_force     TEXT    NOT NULL,
             limit_price       INTEGER,
             stop_price        INTEGER,
             filled_quantity   INTEGER NOT NULL,
@@ -233,8 +234,8 @@ class SQLiteRecorder(RecorderBase):
     _SQL_INSERT_EXPOSURE_SNAPSHOT_WORKING_ORDER = """
         INSERT INTO broker_exposure_snapshot_working_order
             (run_id, occurred_at_ns, internal_order_id, symbol, order_type,
-             side, quantity, limit_price, stop_price, filled_quantity)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             side, quantity, time_in_force, limit_price, stop_price, filled_quantity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     _SQL_INSERT_EXPOSURE_SNAPSHOT_POSITION = """
@@ -432,16 +433,17 @@ class SQLiteRecorder(RecorderBase):
                         (
                             str(self._run_id),
                             int(e.occurred_at_ns),
-                            str(order_id),
+                            str(wo.internal_order_id),
                             wo.symbol,
                             wo.order_type.name,
                             wo.side.name,
                             int(wo.quantity),
+                            wo.time_in_force.name,
                             int(wo.limit_price) if wo.limit_price is not None else None,
                             int(wo.stop_price) if wo.stop_price is not None else None,
                             int(wo.filled_quantity),
                         )
-                        for order_id, wo in e.working_orders.items()
+                        for wo in e.working_orders.values()
                     ],
                 )
                 self._conn.executemany(
