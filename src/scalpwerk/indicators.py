@@ -429,3 +429,118 @@ class SwingLow(_SwingBase):
 
     def swing_bar_ns(self, symbol: str) -> int:
         return self._last_low_ns.get(symbol, 0)
+
+
+class _BBTurnaroundBase(IndicatorBase, abc.ABC):
+    def __init__(
+        self,
+        period: int = 20,
+        num_std: float = 2.0,
+        method: str = "pivot",
+        lookback: int = 3,
+        ma_period: int = 5,
+        bar_field: Enums.BarField = Enums.BarField.CLOSE,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._period = period
+        self._num_std = num_std
+        self._method = method
+        self._lookback = lookback
+        self._ma_period = ma_period
+        self._bar_field = bar_field
+
+        needed = max(2 * lookback + 1, ma_period + 1)
+        self._bb_upper = BollingerUpper(
+            period=period,
+            num_std=num_std,
+            bar_field=bar_field,
+            max_history=max(max_history, needed),
+        )
+        self._bb_lower = BollingerLower(
+            period=period,
+            num_std=num_std,
+            bar_field=bar_field,
+            max_history=max(max_history, needed),
+        )
+        self.add_indicator(self._bb_upper)
+        self.add_indicator(self._bb_lower)
+
+    def _compute_turnarounds(self, event: Events.Datafeed.Bar) -> tuple[float, float]:
+        symbol = event.symbol
+
+        if self._method == "pivot":
+            return self._pivot_detect(symbol)
+        return self._ma_crossover_detect(symbol)
+
+    def _pivot_detect(self, symbol: str) -> tuple[float, float]:
+        n = self._lookback
+        window_size = 2 * n + 1
+
+        lower_vals = [self._bb_lower[symbol, -i] for i in range(window_size, 0, -1)]
+        upper_vals = [self._bb_upper[symbol, -i] for i in range(window_size, 0, -1)]
+
+        if any(math.isnan(v) for v in lower_vals) or any(
+            math.isnan(v) for v in upper_vals
+        ):
+            return 0.0, 0.0
+
+        lower_turn = 1.0 if lower_vals[n] == min(lower_vals) else 0.0
+        upper_turn = 1.0 if upper_vals[n] == max(upper_vals) else 0.0
+
+        return lower_turn, upper_turn
+
+    def _ma_crossover_detect(self, symbol: str) -> tuple[float, float]:
+        mp = self._ma_period
+
+        lower_vals = [self._bb_lower[symbol, -i] for i in range(mp + 1, 0, -1)]
+        upper_vals = [self._bb_upper[symbol, -i] for i in range(mp + 1, 0, -1)]
+
+        if any(math.isnan(v) for v in lower_vals) or any(
+            math.isnan(v) for v in upper_vals
+        ):
+            return 0.0, 0.0
+
+        lower_ma_prev = sum(lower_vals[:-1]) / mp
+        lower_ma_curr = sum(lower_vals[1:]) / mp
+        lower_turn = (
+            1.0
+            if lower_vals[-2] <= lower_ma_prev and lower_vals[-1] > lower_ma_curr
+            else 0.0
+        )
+
+        upper_ma_prev = sum(upper_vals[:-1]) / mp
+        upper_ma_curr = sum(upper_vals[1:]) / mp
+        upper_turn = (
+            1.0
+            if upper_vals[-2] >= upper_ma_prev and upper_vals[-1] < upper_ma_curr
+            else 0.0
+        )
+
+        return lower_turn, upper_turn
+
+
+class BBLowerTurnaround(_BBTurnaroundBase):
+    @property
+    def name(self) -> str:
+        return (
+            f"BB_LOWER_TURN_{self._period}_{self._num_std}"
+            f"_{self._method}_{self._bar_field.name}"
+        )
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        lower, _ = self._compute_turnarounds(event)
+        return lower
+
+
+class BBUpperTurnaround(_BBTurnaroundBase):
+    @property
+    def name(self) -> str:
+        return (
+            f"BB_UPPER_TURN_{self._period}_{self._num_std}"
+            f"_{self._method}_{self._bar_field.name}"
+        )
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        _, upper = self._compute_turnarounds(event)
+        return upper
