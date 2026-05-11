@@ -324,3 +324,108 @@ class ReverseRSI(IndicatorBase):
             return c0 + x
         else:
             return c0 + x * ((100.0 - target) / target)
+
+
+_SEEKING_HIGH = 0
+_SEEKING_LOW = 1
+
+
+class _SwingBase(IndicatorBase, abc.ABC):
+    def __init__(
+        self,
+        atr_period: int = 14,
+        atr_multiplier: float = 2.0,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._atr_period = atr_period
+        self._atr_multiplier = atr_multiplier
+
+        self._atr_ind = ATR(period=atr_period, max_history=2)
+        self.add_indicator(self._atr_ind)
+
+        self._state: dict[str, int] = {}
+        self._tracked_high: dict[str, float] = {}
+        self._tracked_high_ns: dict[str, int] = {}
+        self._tracked_low: dict[str, float] = {}
+        self._tracked_low_ns: dict[str, int] = {}
+        self._last_high: dict[str, float] = {}
+        self._last_high_ns: dict[str, int] = {}
+        self._last_low: dict[str, float] = {}
+        self._last_low_ns: dict[str, int] = {}
+
+    def _compute_swings(self, event: Events.Datafeed.Bar) -> tuple[float, float]:
+        symbol = event.symbol
+        scale = Constants.PRICE_SCALE
+        high = float(event.high) / scale
+        low = float(event.low) / scale
+        ts = event.occurred_at_ns
+
+        atr = self._atr_ind.latest(symbol)
+        if math.isnan(atr):
+            return math.nan, math.nan
+
+        threshold = self._atr_multiplier * atr
+
+        if symbol not in self._state:
+            self._state[symbol] = _SEEKING_HIGH
+            self._tracked_high[symbol] = high
+            self._tracked_high_ns[symbol] = ts
+            self._tracked_low[symbol] = low
+            self._tracked_low_ns[symbol] = ts
+            return math.nan, math.nan
+
+        if self._state[symbol] == _SEEKING_HIGH:
+            if high > self._tracked_high[symbol]:
+                self._tracked_high[symbol] = high
+                self._tracked_high_ns[symbol] = ts
+
+            if self._tracked_high[symbol] - low >= threshold:
+                self._last_high[symbol] = self._tracked_high[symbol]
+                self._last_high_ns[symbol] = self._tracked_high_ns[symbol]
+                self._state[symbol] = _SEEKING_LOW
+                self._tracked_low[symbol] = low
+                self._tracked_low_ns[symbol] = ts
+
+        else:
+            if low < self._tracked_low[symbol]:
+                self._tracked_low[symbol] = low
+                self._tracked_low_ns[symbol] = ts
+
+            if high - self._tracked_low[symbol] >= threshold:
+                self._last_low[symbol] = self._tracked_low[symbol]
+                self._last_low_ns[symbol] = self._tracked_low_ns[symbol]
+                self._state[symbol] = _SEEKING_HIGH
+                self._tracked_high[symbol] = high
+                self._tracked_high_ns[symbol] = ts
+
+        return (
+            self._last_high.get(symbol, math.nan),
+            self._last_low.get(symbol, math.nan),
+        )
+
+
+class SwingHigh(_SwingBase):
+    @property
+    def name(self) -> str:
+        return f"SWING_HIGH_{self._atr_period}_{self._atr_multiplier}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        high, _ = self._compute_swings(event)
+        return high
+
+    def swing_bar_ns(self, symbol: str) -> int:
+        return self._last_high_ns.get(symbol, 0)
+
+
+class SwingLow(_SwingBase):
+    @property
+    def name(self) -> str:
+        return f"SWING_LOW_{self._atr_period}_{self._atr_multiplier}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        _, low = self._compute_swings(event)
+        return low
+
+    def swing_bar_ns(self, symbol: str) -> int:
+        return self._last_low_ns.get(symbol, 0)
