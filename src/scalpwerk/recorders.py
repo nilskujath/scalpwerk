@@ -1,3 +1,4 @@
+import math
 import pathlib
 import sqlite3
 import uuid
@@ -370,6 +371,7 @@ class SQLiteRecorder(RecorderBase):
                             float(value),
                         )
                         for name, value in e.indicator_values.items()
+                        if not math.isnan(value)
                     ],
                 )
 

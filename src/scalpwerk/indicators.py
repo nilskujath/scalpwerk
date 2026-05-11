@@ -84,3 +84,66 @@ class ATR(IndicatorBase):
             self._atr[symbol] * (self._period - 1) + true_range
         ) / self._period
         return self._atr[symbol]
+
+
+class RSI(IndicatorBase):
+
+    def __init__(
+        self,
+        period: int = 14,
+        bar_field: Enums.BarField = Enums.BarField.CLOSE,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._period = period
+        self._bar_field = bar_field
+        self._prev_value: dict[str, float] = {}
+        self._gain_buffer: dict[str, list[tuple[float, float]]] = {}
+        self._avg_gain: dict[str, float] = {}
+        self._avg_loss: dict[str, float] = {}
+
+    @property
+    def name(self) -> str:
+        return f"RSI_{self._period}_{self._bar_field.name}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        symbol = event.symbol
+        value = float(getattr(event, self._bar_field.value))
+
+        # First bar: no previous value, no change yet.
+        if symbol not in self._prev_value:
+            self._prev_value[symbol] = value
+            self._gain_buffer[symbol] = []
+            return math.nan
+
+        change = value - self._prev_value[symbol]
+        self._prev_value[symbol] = value
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+
+        # Accumulation phase: collect gains/losses for the initial simple average.
+        if symbol not in self._avg_gain:
+            self._gain_buffer[symbol].append((gain, loss))
+            if len(self._gain_buffer[symbol]) < self._period:
+                return math.nan
+            gains, losses = zip(*self._gain_buffer[symbol])
+            self._avg_gain[symbol] = sum(gains) / self._period
+            self._avg_loss[symbol] = sum(losses) / self._period
+            del self._gain_buffer[symbol]
+        else:
+            # Wilder's smoothing.
+            self._avg_gain[symbol] = (
+                self._avg_gain[symbol] * (self._period - 1) + gain
+            ) / self._period
+            self._avg_loss[symbol] = (
+                self._avg_loss[symbol] * (self._period - 1) + loss
+            ) / self._period
+
+        avg_gain = self._avg_gain[symbol]
+        avg_loss = self._avg_loss[symbol]
+
+        if avg_loss == 0.0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        return 100.0 - 100.0 / (1.0 + rs)

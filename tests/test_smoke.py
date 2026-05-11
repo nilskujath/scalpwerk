@@ -5,6 +5,7 @@ Verifies the full pipeline: CSVDatafeedConnector → SimulatedBroker → Strateg
 """
 
 from scalpwerk.core import Enums, Orchestrator, StrategyBase, Events
+from scalpwerk.indicators import SMA, ATR, RSI
 from scalpwerk.simulated import CSVDatafeedConnector, SimulatedBroker
 from scalpwerk.recorders import SQLiteRecorder
 
@@ -39,6 +40,9 @@ class SmokeStrategy(StrategyBase):
 
     def setup(self) -> None:
         self._bar_count = 0
+        self.sma = self.add_indicator(SMA(period=20, bar_field=Enums.BarField.CLOSE))
+        self.atr = self.add_indicator(ATR(period=14))
+        self.rsi = self.add_indicator(RSI(period=14))
 
     def on_bar(self, bar: Events.Datafeed.Bar) -> None:
         self._bar_count += 1
@@ -95,5 +99,17 @@ if __name__ == "__main__":
 
     bars = conn.execute("SELECT COUNT(*) as n FROM datafeed_bar").fetchone()
     print(f"\nBars recorded: {bars['n']}")
+
+    indicators = conn.execute(
+        "SELECT indicator_name, COUNT(*) as n, "
+        "MIN(indicator_value) as min_val, MAX(indicator_value) as max_val "
+        "FROM strategy_indicator_value GROUP BY indicator_name"
+    ).fetchall()
+    print(f"\nIndicators ({len(indicators)}):")
+    for ind in indicators:
+        print(
+            f"  {ind['indicator_name']}: {ind['n']} values, "
+            f"range [{ind['min_val']:.2f}, {ind['max_val']:.2f}]"
+        )
 
     conn.close()
