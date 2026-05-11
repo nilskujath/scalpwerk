@@ -1,4 +1,5 @@
 import csv
+import datetime
 import threading
 import typing
 import uuid
@@ -16,6 +17,8 @@ from .core import (
 
 class CSVDatafeedConnector(DatafeedConnectorBase):
     CSV_PATH: str
+    START: str | None = None  # ISO 8601 UTC, e.g. "2020-01-06" or "2020-01-06T14:30:00"
+    STOP: str | None = None  # bars outside [START, STOP) are skipped
 
     _DATABENTO_RTYPE_TO_BAR_PERIOD: dict[int, Enums.BarPeriod] = {
         32: Enums.BarPeriod.OHLCV_1S,
@@ -42,6 +45,13 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
             self._subscriptions.add((record_type, symbol))
 
     def _connect(self) -> None:
+        self._start_ns = (
+            self._iso_to_unix_ns(self.START) if self.START is not None else None
+        )
+        self._stop_ns = (
+            self._iso_to_unix_ns(self.STOP) if self.STOP is not None else None
+        )
+
         self._csv_file = open(self.CSV_PATH, newline="")
         self._csv_reader = csv.reader(self._csv_file)
         header = next(self._csv_reader)
@@ -52,6 +62,13 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
         self._stop_event.clear()
         self._streaming_thread = threading.Thread(target=self._stream)
         self._streaming_thread.start()
+
+    @staticmethod
+    def _iso_to_unix_ns(iso: str) -> int:
+        dt = datetime.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1_000_000_000)
 
     def _disconnect(self) -> None:
         self._stop_event.set()
@@ -68,8 +85,18 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
             if self._csv_reader is None:
                 raise RuntimeError("CSV reader not initialized")
 
+            ts_i = self._column_indices["ts_event"]
+
             for row in self._csv_reader:
                 if self._stop_event.is_set():
+                    break
+
+                ts_ns = int(row[ts_i])
+
+                if self._start_ns is not None and ts_ns < self._start_ns:
+                    continue
+                # Data is chronological — no need to read past the stop.
+                if self._stop_ns is not None and ts_ns >= self._stop_ns:
                     break
 
                 symbol = row[self._column_indices["symbol"]]
@@ -82,9 +109,7 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
 
                 self._emit_event(
                     Events.Datafeed.Bar(
-                        occurred_at_ns=Types.UnixNanoseconds(
-                            int(row[self._column_indices["ts_event"]])
-                        ),
+                        occurred_at_ns=Types.UnixNanoseconds(ts_ns),
                         symbol=symbol,
                         record_type=record_type,
                         open=Types.ScaledPrice(int(row[self._column_indices["open"]])),

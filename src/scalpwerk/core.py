@@ -41,6 +41,13 @@ class Enums:  # enums to model domain concepts with a fixed set of possible valu
         DAY = enum.auto()
         GTC = enum.auto()
         IOC = enum.auto()
+
+    class BarField(enum.Enum):
+        OPEN   = "open"
+        HIGH   = "high"
+        LOW    = "low"
+        CLOSE  = "close"
+        VOLUME = "volume"
     # fmt: on
 
 
