@@ -1,11 +1,25 @@
+import abc
 import collections
 import math
 
-from .core import Enums, Events, IndicatorBase
+from .core import Constants, Enums, Events, IndicatorBase
+
+_PRICE_FIELDS = frozenset(
+    {
+        Enums.BarField.OPEN,
+        Enums.BarField.HIGH,
+        Enums.BarField.LOW,
+        Enums.BarField.CLOSE,
+    }
+)
+
+
+def _read_bar_field(event: Events.Datafeed.Bar, bar_field: Enums.BarField) -> float:
+    raw = float(getattr(event, bar_field.value))
+    return raw / Constants.PRICE_SCALE if bar_field in _PRICE_FIELDS else raw
 
 
 class SMA(IndicatorBase):
-
     def __init__(
         self,
         period: int = 200,
@@ -22,7 +36,7 @@ class SMA(IndicatorBase):
         return f"SMA_{self._period}_{self._bar_field.name}"
 
     def _compute(self, event: Events.Datafeed.Bar) -> float:
-        value = float(getattr(event, self._bar_field.value))
+        value = _read_bar_field(event, self._bar_field)
         symbol = event.symbol
 
         if symbol not in self._windows:
@@ -37,7 +51,6 @@ class SMA(IndicatorBase):
 
 
 class ATR(IndicatorBase):
-
     def __init__(
         self,
         period: int = 14,
@@ -55,22 +68,20 @@ class ATR(IndicatorBase):
 
     def _compute(self, event: Events.Datafeed.Bar) -> float:
         symbol = event.symbol
-        high = float(event.high)
-        low = float(event.low)
-        close = float(event.close)
+        scale = Constants.PRICE_SCALE
+        high = float(event.high) / scale
+        low = float(event.low) / scale
+        close = float(event.close) / scale
 
-        # First bar: no previous close, so no True Range yet.
         if symbol not in self._prev_close:
             self._prev_close[symbol] = close
             self._tr_buffer[symbol] = []
             return math.nan
 
-        # True Range: largest of intra-bar range, gap-up reach, gap-down reach.
         prev_close = self._prev_close[symbol]
         true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
         self._prev_close[symbol] = close
 
-        # Accumulation phase: collect True Ranges for the initial simple average.
         if symbol not in self._atr:
             self._tr_buffer[symbol].append(true_range)
             if len(self._tr_buffer[symbol]) < self._period:
@@ -79,7 +90,6 @@ class ATR(IndicatorBase):
             del self._tr_buffer[symbol]
             return self._atr[symbol]
 
-        # Wilder's smoothing.
         self._atr[symbol] = (
             self._atr[symbol] * (self._period - 1) + true_range
         ) / self._period
@@ -87,7 +97,6 @@ class ATR(IndicatorBase):
 
 
 class RSI(IndicatorBase):
-
     def __init__(
         self,
         period: int = 14,
@@ -108,9 +117,8 @@ class RSI(IndicatorBase):
 
     def _compute(self, event: Events.Datafeed.Bar) -> float:
         symbol = event.symbol
-        value = float(getattr(event, self._bar_field.value))
+        value = _read_bar_field(event, self._bar_field)
 
-        # First bar: no previous value, no change yet.
         if symbol not in self._prev_value:
             self._prev_value[symbol] = value
             self._gain_buffer[symbol] = []
@@ -121,7 +129,6 @@ class RSI(IndicatorBase):
         gain = max(change, 0.0)
         loss = max(-change, 0.0)
 
-        # Accumulation phase: collect gains/losses for the initial simple average.
         if symbol not in self._avg_gain:
             self._gain_buffer[symbol].append((gain, loss))
             if len(self._gain_buffer[symbol]) < self._period:
@@ -131,7 +138,6 @@ class RSI(IndicatorBase):
             self._avg_loss[symbol] = sum(losses) / self._period
             del self._gain_buffer[symbol]
         else:
-            # Wilder's smoothing.
             self._avg_gain[symbol] = (
                 self._avg_gain[symbol] * (self._period - 1) + gain
             ) / self._period
@@ -147,3 +153,174 @@ class RSI(IndicatorBase):
 
         rs = avg_gain / avg_loss
         return 100.0 - 100.0 / (1.0 + rs)
+
+
+class _BollingerBase(IndicatorBase, abc.ABC):
+    def __init__(
+        self,
+        period: int = 20,
+        num_std: float = 2.0,
+        bar_field: Enums.BarField = Enums.BarField.CLOSE,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._period = period
+        self._num_std = num_std
+        self._bar_field = bar_field
+        self._windows: dict[str, collections.deque[float]] = {}
+
+    def _compute_bands(self, event: Events.Datafeed.Bar) -> tuple[float, float, float]:
+        value = _read_bar_field(event, self._bar_field)
+        symbol = event.symbol
+
+        if symbol not in self._windows:
+            self._windows[symbol] = collections.deque(maxlen=self._period)
+        self._windows[symbol].append(value)
+
+        if len(self._windows[symbol]) < self._period:
+            return math.nan, math.nan, math.nan
+
+        window = self._windows[symbol]
+        mean = sum(window) / self._period
+
+        variance = sum((x - mean) ** 2 for x in window) / self._period
+        std = math.sqrt(variance)
+
+        upper = mean + self._num_std * std
+        lower = mean - self._num_std * std
+        bandwidth = (upper - lower) / mean * 100.0 if mean != 0.0 else math.nan
+
+        return upper, lower, bandwidth
+
+
+class BollingerUpper(_BollingerBase):
+    @property
+    def name(self) -> str:
+        return f"BB_UPPER_{self._period}_{self._num_std}_{self._bar_field.name}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        upper, _, _ = self._compute_bands(event)
+        return upper
+
+
+class BollingerLower(_BollingerBase):
+    @property
+    def name(self) -> str:
+        return f"BB_LOWER_{self._period}_{self._num_std}_{self._bar_field.name}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        _, lower, _ = self._compute_bands(event)
+        return lower
+
+
+class BollingerBandwidth(_BollingerBase):
+    @property
+    def name(self) -> str:
+        return f"BB_BW_{self._period}_{self._num_std}_{self._bar_field.name}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        _, _, bandwidth = self._compute_bands(event)
+        return bandwidth
+
+
+class BoostedRSI(IndicatorBase):
+    def __init__(
+        self,
+        rsi_period: int = 14,
+        momentum_period: int = 9,
+        short_rsi_period: int = 3,
+        short_rsi_smoothing: int = 3,
+        bar_field: Enums.BarField = Enums.BarField.CLOSE,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._rsi_period = rsi_period
+        self._momentum_period = momentum_period
+        self._short_rsi_period = short_rsi_period
+        self._short_rsi_smoothing = short_rsi_smoothing
+        self._bar_field = bar_field
+
+        self._rsi_main = RSI(
+            period=rsi_period,
+            bar_field=bar_field,
+            max_history=max(max_history, momentum_period + 1),
+        )
+        self._rsi_short = RSI(
+            period=short_rsi_period,
+            bar_field=bar_field,
+            max_history=max(max_history, short_rsi_smoothing),
+        )
+        self.add_indicator(self._rsi_main)
+        self.add_indicator(self._rsi_short)
+
+    @property
+    def name(self) -> str:
+        return (
+            f"CBCI_{self._rsi_period}_{self._momentum_period}"
+            f"_{self._short_rsi_period}_{self._short_rsi_smoothing}"
+            f"_{self._bar_field.name}"
+        )
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        symbol = event.symbol
+
+        rsi_now = self._rsi_main.latest(symbol)
+        if math.isnan(rsi_now):
+            return math.nan
+
+        rsi_past = self._rsi_main[symbol, -(self._momentum_period + 1)]
+        if math.isnan(rsi_past):
+            return math.nan
+        rsi_momentum = rsi_now - rsi_past
+
+        short_values = [
+            self._rsi_short[symbol, -i] for i in range(1, self._short_rsi_smoothing + 1)
+        ]
+        if any(math.isnan(v) for v in short_values):
+            return math.nan
+        rsi_smoothed = sum(short_values) / self._short_rsi_smoothing
+
+        return rsi_momentum + rsi_smoothed
+
+
+class ReverseRSI(IndicatorBase):
+    def __init__(
+        self,
+        period: int = 14,
+        target_rsi: float = 80.0,
+        bar_field: Enums.BarField = Enums.BarField.CLOSE,
+        max_history: int = 100,
+    ) -> None:
+        super().__init__(max_history=max_history)
+        self._period = period
+        self._target_rsi = target_rsi
+        self._bar_field = bar_field
+
+        self._rsi = RSI(period=period, bar_field=bar_field, max_history=max_history)
+        self.add_indicator(self._rsi)
+
+    @property
+    def name(self) -> str:
+        return f"REV_RSI_{self._period}_{self._target_rsi}_{self._bar_field.name}"
+
+    def _compute(self, event: Events.Datafeed.Bar) -> float:
+        symbol = event.symbol
+
+        if symbol not in self._rsi._avg_gain:
+            return math.nan
+
+        auc = self._rsi._avg_gain[symbol]
+        adc = self._rsi._avg_loss[symbol]
+        c0 = self._rsi._prev_value[symbol]
+        k = self._period
+        target = self._target_rsi
+
+        if target <= 0.0 or target >= 100.0:
+            return math.nan
+
+        x = (k - 1) * (adc * (target / (100.0 - target)) - auc)
+
+        if x >= 0.0:
+            return c0 + x
+        else:
+            return c0 + x * ((100.0 - target) / target)
