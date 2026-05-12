@@ -12,7 +12,7 @@ from .core import (
 class SQLiteRecorder(RecorderBase):
     DB_PATH: pathlib.Path = pathlib.Path("runs.db")
 
-    _SCHEMA_VERSION = 5
+    _SCHEMA_VERSION = 6
 
     _SCHEMA = """
         CREATE TABLE IF NOT EXISTS runs (
@@ -189,6 +189,13 @@ class SQLiteRecorder(RecorderBase):
             internal_order_id TEXT    NOT NULL,
             PRIMARY KEY (run_id, internal_order_id)
         );
+
+        CREATE TABLE IF NOT EXISTS indicator_config (
+            run_id         TEXT    NOT NULL REFERENCES runs(run_id),
+            indicator_name TEXT    NOT NULL,
+            plot_at        INTEGER NOT NULL,
+            PRIMARY KEY (run_id, indicator_name)
+        );
     """
 
     # fmt: off
@@ -295,6 +302,12 @@ class SQLiteRecorder(RecorderBase):
         VALUES (?, ?, ?, ?)
     """
 
+    _SQL_INSERT_INDICATOR_CONFIG = """
+        INSERT OR IGNORE INTO indicator_config
+            (run_id, indicator_name, plot_at)
+        VALUES (?, ?, ?)
+    """
+
     _SQL_INSERT_RUN = """
         INSERT INTO runs (run_id) VALUES (?)
     """
@@ -304,6 +317,7 @@ class SQLiteRecorder(RecorderBase):
     def __init__(self) -> None:
         self._run_id: str = str(uuid.uuid4())
         self._conn: sqlite3.Connection | None = None
+        self._indicator_config_written: bool = False
         super().__init__()
 
     def _setup_db(self) -> None:
@@ -343,6 +357,17 @@ class SQLiteRecorder(RecorderBase):
 
         match event:
             case Events.Strategy.IndicatorUpdate() as e:
+                if not self._indicator_config_written:
+                    self._indicator_config_written = True
+                    for strategy in self._strategies:
+                        self._conn.executemany(
+                            self._SQL_INSERT_INDICATOR_CONFIG,
+                            [
+                                (str(self._run_id), name, plot_at)
+                                for name, plot_at in strategy._indicator_plot_at.items()
+                            ],
+                        )
+
                 src = e.source_event
                 self._conn.execute(
                     self._SQL_INSERT_BAR,

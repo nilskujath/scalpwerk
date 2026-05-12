@@ -5,7 +5,20 @@ Verifies the full pipeline: CSVDatafeedConnector → SimulatedBroker → Strateg
 """
 
 from scalpwerk.core import Enums, Orchestrator, StrategyBase, Events
-from scalpwerk.indicators import SMA, ATR, RSI
+from scalpwerk.indicators import (
+    SMA,
+    ATR,
+    RSI,
+    ReverseRSI,
+    BollingerUpper,
+    BollingerLower,
+    BollingerBandwidth,
+    BoostedRSI,
+    SwingHigh,
+    SwingLow,
+    BBLowerTurnaround,
+    BBUpperTurnaround,
+)
 from scalpwerk.simulated import CSVDatafeedConnector, SimulatedBroker
 from scalpwerk.recorders import SQLiteRecorder
 
@@ -43,6 +56,25 @@ class SmokeStrategy(StrategyBase):
         self.sma = self.add_indicator(SMA(period=20, bar_field=Enums.BarField.CLOSE))
         self.atr = self.add_indicator(ATR(period=14))
         self.rsi = self.add_indicator(RSI(period=14))
+
+        self.bb_upper = self.add_indicator(BollingerUpper(period=20, num_std=2.0))
+        self.bb_lower = self.add_indicator(BollingerLower(period=20, num_std=2.0))
+        self.bb_bw = self.add_indicator(BollingerBandwidth(period=20, num_std=2.0))
+
+        self.cbci = self.add_indicator(BoostedRSI())
+
+        self.rev_rsi_ob = self.add_indicator(ReverseRSI(target_rsi=80.0))
+        self.rev_rsi_os = self.add_indicator(ReverseRSI(target_rsi=20.0))
+
+        self.swing_high = self.add_indicator(
+            SwingHigh(atr_period=14, atr_multiplier=2.0)
+        )
+        self.swing_low = self.add_indicator(SwingLow(atr_period=14, atr_multiplier=2.0))
+
+        self.bb_lower_turn = self.add_indicator(BBLowerTurnaround(method="pivot"))
+        self.bb_upper_turn = self.add_indicator(
+            BBUpperTurnaround(method="ma_crossover")
+        )
 
     def on_bar(self, bar: Events.Datafeed.Bar) -> None:
         self._bar_count += 1

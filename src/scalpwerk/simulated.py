@@ -35,7 +35,7 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
         self._csv_reader: typing.Any | None = None
         self._column_indices: dict[str, int] = {}
 
-    # Called before connect(). Just collects; streaming starts in _connect().
+    # Called before _connect(). Just collects; streaming starts in _connect().
     def subscribe(
         self,
         symbols: list[str],
@@ -53,15 +53,64 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
         )
 
         self._csv_file = open(self.CSV_PATH, newline="")
+
+        # Read header first, then binary-search to the START offset so we
+        # never scan millions of irrelevant rows.
+        header_line = self._csv_file.readline()
+        self._column_indices = {
+            name: i for i, name in enumerate(header_line.strip().split(","))
+        }
+
+        if self._start_ns is not None:
+            self._seek_to_start()
+
         self._csv_reader = csv.reader(self._csv_file)
-        header = next(self._csv_reader)
-        self._column_indices = {name: i for i, name in enumerate(header)}
 
         # Streaming starts here, not in subscribe(). The Orchestrator calls
-        # subscribe() before connect(), so all subscriptions are set by now.
+        # subscribe() before _connect(), so all subscriptions are set by now.
         self._stop_event.clear()
         self._streaming_thread = threading.Thread(target=self._stream)
         self._streaming_thread.start()
+
+    def _seek_to_start(self) -> None:
+        """Binary-search the CSV for the first row with ts_event >= START."""
+        assert self._csv_file is not None
+        assert self._start_ns is not None
+        ts_i = self._column_indices["ts_event"]
+
+        # lo = right after the header, hi = end of file.
+        self._csv_file.seek(0, 2)
+        hi = self._csv_file.tell()
+        self._csv_file.seek(0)
+        self._csv_file.readline()  # skip header
+        lo = self._csv_file.tell()
+
+        result = lo  # fallback: start right after header
+
+        while lo < hi:
+            mid = (lo + hi) // 2
+            self._csv_file.seek(mid)
+            self._csv_file.readline()  # skip partial line
+            pos = self._csv_file.tell()
+
+            if pos >= hi:
+                hi = mid
+                continue
+
+            line = self._csv_file.readline()
+            if not line:
+                hi = mid
+                continue
+
+            ts_ns = int(line.split(",", ts_i + 2)[ts_i])
+
+            if ts_ns < self._start_ns:
+                lo = pos
+            else:
+                result = pos
+                hi = mid
+
+        self._csv_file.seek(result)
 
     @staticmethod
     def _iso_to_unix_ns(iso: str) -> int:
@@ -144,6 +193,7 @@ class SimulatedBroker(BrokerConnectorBase):
         self._limit_orders: dict[uuid.UUID, Exposure.WorkingOrder] = {}
 
         self._positions: dict[str, Exposure.Position] = {}
+        self._lots: dict[str, list[tuple[int, Types.ScaledPrice]]] = {}
         super().__init__()
 
     def _connect(self) -> None:
@@ -298,49 +348,47 @@ class SimulatedBroker(BrokerConnectorBase):
                 fill_price - commission_scaled // fill_quantity
             )
 
-        # Update position.
+        # Update position and FIFO lots.
         current_position = self._positions.get(order.symbol)
+        lots = self._lots.get(order.symbol, [])
 
         if current_position is None:
-            # No existing position — new position at fill price.
+            # New position — single lot at fill price.
             new_size = signed_fill_quantity
             new_cost_basis = commission_adjusted_fill_price
-            self._positions[order.symbol] = Exposure.Position(
-                size=new_size,
-                cost_basis=new_cost_basis,
-            )
+            lots = [(abs(signed_fill_quantity), commission_adjusted_fill_price)]
         else:
-            # Existing position — compute new size and cost basis.
             new_size = current_position.size + signed_fill_quantity
             adding_to_position = (current_position.size > 0) == (
                 signed_fill_quantity > 0
             )
 
             if new_size == 0:
+                # Closing — clear lots.
                 new_cost_basis = Types.ScaledPrice(0)
+                lots = []
             elif adding_to_position:
-                # Weighted average cost basis.
-                new_cost_basis = Types.ScaledPrice(
-                    (
-                        abs(current_position.size) * current_position.cost_basis
-                        + abs(signed_fill_quantity) * commission_adjusted_fill_price
-                    )
-                    // abs(new_size)
-                )
+                # Adding — append new lot, weighted avg of all lots.
+                lots.append((abs(signed_fill_quantity), commission_adjusted_fill_price))
+                new_cost_basis = self._weighted_avg_cost_basis(lots)
             elif abs(signed_fill_quantity) > abs(current_position.size):
-                # Flipped position: cost basis is the fill price.
+                # Flipped — clear old lots, create new lot at fill price.
                 new_cost_basis = commission_adjusted_fill_price
+                lots = [(abs(new_size), commission_adjusted_fill_price)]
             else:
-                # Reducing position: cost basis unchanged.
-                new_cost_basis = current_position.cost_basis
+                # Reducing — FIFO: consume oldest lots first.
+                lots = self._consume_lots_fifo(lots, abs(signed_fill_quantity))
+                new_cost_basis = self._weighted_avg_cost_basis(lots)
 
-            if new_size == 0:
-                self._positions.pop(order.symbol, None)
-            else:
-                self._positions[order.symbol] = Exposure.Position(
-                    size=new_size,
-                    cost_basis=new_cost_basis,
-                )
+        if new_size == 0:
+            self._positions.pop(order.symbol, None)
+            self._lots.pop(order.symbol, None)
+        else:
+            self._positions[order.symbol] = Exposure.Position(
+                size=new_size,
+                cost_basis=new_cost_basis,
+            )
+            self._lots[order.symbol] = lots
 
         # noinspection PyArgumentList
         self._emit_event(
@@ -378,12 +426,12 @@ class SimulatedBroker(BrokerConnectorBase):
         working_order = Exposure.WorkingOrder(
             internal_order_id=event.internal_order_id,
             symbol=event.symbol,
-            order_type=event.order_type,
-            side=event.side,
-            quantity=event.quantity,
             time_in_force=event.time_in_force,
+            side=event.side,
+            order_type=event.order_type,
             limit_price=event.limit_price,
             stop_price=event.stop_price,
+            quantity=event.quantity,
             filled_quantity=0,
         )
 
@@ -484,6 +532,30 @@ class SimulatedBroker(BrokerConnectorBase):
                 reason="order not found",
             )
         )
+
+    @staticmethod
+    def _weighted_avg_cost_basis(
+        lots: list[tuple[int, Types.ScaledPrice]],
+    ) -> Types.ScaledPrice:
+        total_qty = sum(qty for qty, _ in lots)
+        return Types.ScaledPrice(sum(qty * cost for qty, cost in lots) // total_qty)
+
+    @staticmethod
+    def _consume_lots_fifo(
+        lots: list[tuple[int, Types.ScaledPrice]],
+        quantity: int,
+    ) -> list[tuple[int, Types.ScaledPrice]]:
+        remaining = quantity
+        result: list[tuple[int, Types.ScaledPrice]] = []
+        for qty, cost in lots:
+            if remaining <= 0:
+                result.append((qty, cost))
+            elif qty <= remaining:
+                remaining -= qty
+            else:
+                result.append((qty - remaining, cost))
+                remaining = 0
+        return result
 
     @staticmethod
     def _validate_order_fields(

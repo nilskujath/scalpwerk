@@ -4,6 +4,14 @@ import math
 
 from .core import Constants, Enums, Events, IndicatorBase
 
+_BAR_FIELD_ATTR: dict[Enums.BarField, str] = {
+    Enums.BarField.OPEN: "open",
+    Enums.BarField.HIGH: "high",
+    Enums.BarField.LOW: "low",
+    Enums.BarField.CLOSE: "close",
+    Enums.BarField.VOLUME: "volume",
+}
+
 _PRICE_FIELDS = frozenset(
     {
         Enums.BarField.OPEN,
@@ -15,7 +23,7 @@ _PRICE_FIELDS = frozenset(
 
 
 def _read_bar_field(event: Events.Datafeed.Bar, bar_field: Enums.BarField) -> float:
-    raw = float(getattr(event, bar_field.value))
+    raw = float(getattr(event, _BAR_FIELD_ATTR[bar_field]))
     return raw / Constants.PRICE_SCALE if bar_field in _PRICE_FIELDS else raw
 
 

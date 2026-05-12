@@ -10,13 +10,15 @@ import typing
 import uuid
 
 
-class Constants:
-    PRICE_SCALE: int = 1_000_000_000
-
-
 class Types:  # aliases for types with non-obvious semantics
     UnixNanoseconds = typing.NewType("UnixNanoseconds", int)  # since UTC unix epoch
-    ScaledPrice = typing.NewType("ScaledPrice", int)  # decimal prices scaled by 10^9
+    ScaledPrice = typing.NewType("ScaledPrice", int)  # for fixed-point price repr.
+
+
+class Constants:
+    PRICE_SCALE: int = (
+        1_000_000_000  # constant for conversion to internal `ScaledPrice` (* 10^9)
+    )
 
 
 class Enums:  # enums to model domain concepts with a fixed set of possible values
@@ -42,12 +44,14 @@ class Enums:  # enums to model domain concepts with a fixed set of possible valu
         GTC = enum.auto()
         IOC = enum.auto()
 
+
+    # TODO I don't think we need that; the SMA should be able to take any value of what is passed into it and automatically reflect that in it's name.
     class BarField(enum.Enum):
-        OPEN   = "open"
-        HIGH   = "high"
-        LOW    = "low"
-        CLOSE  = "close"
-        VOLUME = "volume"
+        OPEN   = enum.auto()
+        HIGH   = enum.auto()
+        LOW    = enum.auto()
+        CLOSE  = enum.auto()
+        VOLUME = enum.auto()
     # fmt: on
 
 
@@ -55,31 +59,17 @@ class Exposure:
     class WorkingOrder(typing.NamedTuple):
         internal_order_id: uuid.UUID
         symbol: str
-        order_type: Enums.OrderType
-        side: Enums.TradeSide
-        quantity: int
         time_in_force: Enums.TimeInForce
+        side: Enums.TradeSide
+        order_type: Enums.OrderType
         limit_price: Types.ScaledPrice | None
         stop_price: Types.ScaledPrice | None
+        quantity: int
         filled_quantity: int
 
     class Position(typing.NamedTuple):
         size: int
         cost_basis: Types.ScaledPrice
-
-
-class _Protocols:
-    class EventLike(typing.Protocol):
-        @property  # decorator for `mypy`; plain attribute would imply settable
-        def occurred_at_ns(self) -> Types.UnixNanoseconds: ...
-        @property
-        def created_at_ns(self) -> Types.UnixNanoseconds: ...
-
-    class SubscriberLike(typing.Protocol):
-        def receive(self, event: "_Protocols.EventLike") -> None: ...
-        def wait_until_idle(self) -> None: ...
-        @property
-        def is_idle(self) -> bool: ...
 
 
 class Events:
@@ -196,11 +186,30 @@ class Events:
     # fmt: on
 
 
+class _Protocols:  # type contracts for `_EventBus` so `core.py` reads top down
+    class EventLike(typing.Protocol):
+        @property  # decorator for `mypy`; plain attribute would imply settable
+        def occurred_at_ns(self) -> Types.UnixNanoseconds: ...
+        @property
+        def created_at_ns(self) -> Types.UnixNanoseconds: ...
+
+    class SubscriberLike(typing.Protocol):
+        def receive(self, event: "_Protocols.EventLike") -> None: ...
+        @property
+        def is_idle(self) -> bool: ...
+        def wait_until_idle(self) -> None: ...
+
+
 class _EventBus:
     def __init__(self) -> None:
         self._per_event_subscriptions: collections.defaultdict[
             type[_Protocols.EventLike], set[_Protocols.SubscriberLike]
         ] = collections.defaultdict(set)
+        self._shutdown_flag: threading.Event | None = None
+
+    def trigger_shutdown(self) -> None:
+        if self._shutdown_flag is not None:
+            self._shutdown_flag.set()
 
     def subscribe(
         self,
@@ -292,13 +301,8 @@ class _EmitterBase:
 
 
 class _Connectable(abc.ABC):
-    # Set by the orchestrator. Subclasses call `self.trigger_shutdown()` to
-    # shut down the entire system (e.g. end of CSV, lost broker connection).
-    _shutdown_flag: threading.Event | None = None
-
     def trigger_shutdown(self) -> None:
-        if self._shutdown_flag is not None:
-            self._shutdown_flag.set()
+        _event_bus.trigger_shutdown()
 
     @abc.abstractmethod
     def connect(self) -> None:
@@ -459,12 +463,15 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
 
     SYMBOLS: set[str] = set()
     RECORD_TYPE: Enums.BarPeriod = Enums.BarPeriod.OHLCV_1S
+    MAX_TRADES: int | None = None
 
     def __init__(self) -> None:
         super().__init__()
 
         self._current_bar: Events.Datafeed.Bar | None = None
         self._indicators: dict[str, IndicatorBase] = {}
+        self._indicator_plot_at: dict[str, int] = {}
+        self._completed_trades: int = 0
 
         # In-flight requests awaiting broker acknowledgement.
         self._submitted_orders: dict[uuid.UUID, Events.Strategy.SubmitOrder] = {}
@@ -481,8 +488,11 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
     def setup(self) -> None:
         pass
 
-    def add_indicator(self, indicator: IndicatorBase) -> IndicatorBase:
+    def add_indicator(
+        self, indicator: IndicatorBase, *, plot_at: int = 0
+    ) -> IndicatorBase:
         self._indicators[indicator.name] = indicator
+        self._indicator_plot_at[indicator.name] = plot_at
         return indicator  # for inline assignment: `self.sma = self.add_indicator(...)`
 
     @abc.abstractmethod
@@ -655,12 +665,12 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
         self._working_orders[accepted_order.internal_order_id] = Exposure.WorkingOrder(
             internal_order_id=accepted_order.internal_order_id,
             symbol=order.symbol,
-            order_type=order.order_type,
-            side=order.side,
-            quantity=order.quantity,
             time_in_force=order.time_in_force,
+            side=order.side,
+            order_type=order.order_type,
             limit_price=order.limit_price,
             stop_price=order.stop_price,
+            quantity=order.quantity,
             filled_quantity=0,
         )
 
@@ -730,6 +740,11 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
                     filled_quantity=total_filled
                 )
 
+        if fill.position_size == 0 and self.MAX_TRADES is not None:
+            self._completed_trades += 1
+            if self._completed_trades >= self.MAX_TRADES:
+                _event_bus.trigger_shutdown()
+
     def _on_order_expired(self, expired_order: Events.Broker.OrderExpired) -> None:
         self._working_orders.pop(expired_order.internal_order_id)
         self._submitted_modifications.pop(expired_order.internal_order_id, None)
@@ -737,6 +752,8 @@ class StrategyBase(_SubscriberBase, _EmitterBase):
 
 
 class RecorderBase(_SubscriberBase, abc.ABC):
+    _strategies: list["StrategyBase"] = []
+
     SUBSCRIBE_TO = (
         Events.Strategy.IndicatorUpdate,
         Events.Strategy.SubmitOrder,
@@ -774,18 +791,20 @@ class Orchestrator:
         signal.signal(signal.SIGTERM, lambda sig, frame: self._shutdown_flag.set())
 
         try:
-            # Direct access to _shutdown_flag is intentional: the orchestrator
-            # owns the flag and the connectors, so a setter adds nothing.
+            # The event bus owns the shutdown flag so any component
+            # (strategies, connectors) can trigger a system-wide shutdown.
+            _event_bus._shutdown_flag = self._shutdown_flag
+
+            for recorder in self._recorder_instances:
+                recorder._strategies = self._strategy_instances
 
             # Broker connects first so strategies receive the `ExposureSnapshot`
             # and eventual subseq. fills before trading on received market data.
-            self._broker_instance._shutdown_flag = self._shutdown_flag
             self._broker_instance.connect()
 
-            # Subscribe before connect: subscriptions are configuration,
-            # connect starts streaming. This guarantees all subscriptions
+            # Subscribe before _connect: subscriptions are configuration,
+            # _connect starts streaming. This guarantees all subscriptions
             # are set before the first row is read.
-            self._datafeed_instance._shutdown_flag = self._shutdown_flag
             for strategy in self._strategy_instances:
                 self._datafeed_instance.subscribe(
                     list(strategy.SYMBOLS), strategy.RECORD_TYPE
