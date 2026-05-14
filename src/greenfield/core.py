@@ -41,12 +41,12 @@ class TimeInForce(Enum):
 class WorkingOrder:
     # fmt: off
     symbol:         str
-    order_id:       str
-    side:           TradeSide
-    quantity:       float
+    order_id:       UUID
+    trade_side:     TradeSide
+    quantity:       int
     time_in_force:  TimeInForce
-    limit_price:    ScaledPrice
-    stop_price:     ScaledPrice
+    limit_price:    ScaledPrice | None = None
+    stop_price:     ScaledPrice | None = None
     # fmt: on
 
 
@@ -84,7 +84,15 @@ class Events:
         class StreamRequest(_EventBase):
             # fmt: off
             period_type:    PeriodType
-            symbols:        list[str]
+            symbols:        frozenset[str]
+            # fmt: on
+
+        @dataclass(frozen=True, kw_only=True)
+        class IndicatorUpdate(_EventBase):
+            # fmt: off
+            symbol:         str
+            source_event:   "Events.Datafeed.Bar"
+            ind_values:     dict[str, float]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -120,8 +128,8 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class BrokerConnected(_EventBase):
             # fmt: off
-            working_orders: list[WorkingOrder]
-            open_positions: list[OpenPosition]
+            working_orders: dict[UUID, WorkingOrder]
+            open_positions: dict[str, OpenPosition]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -176,6 +184,7 @@ class Events:
             symbol:         str
             fill_id:        UUID
             order_id:       UUID
+            trade_side:     TradeSide
             filled_qty:     int
             fill_price:     ScaledPrice
 
@@ -198,14 +207,14 @@ class _ComponentLike(Protocol):
 
 class _EventBus:
     def __init__(self) -> None:
-        self.subs: dict[type[_EventBase], set[_ComponentLike]] = defaultdict(set)
+        self._subs: dict[type[_EventBase], set[_ComponentLike]] = defaultdict(set)
 
     def subscribe(self, component: _ComponentLike, *event_types: type[_EventBase]):
         for event_type in event_types:
-            self.subs[event_type].add(component)
+            self._subs[event_type].add(component)
 
     def publish(self, event: _EventBase):
-        for component in self.subs[type(event)]:
+        for component in self._subs[type(event)]:
             component.receive(event)
 
 
@@ -259,7 +268,7 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
     )
 
     @abstractmethod
-    def _subscribe(self, period_type: PeriodType, symbols: list[str]) -> None: ...
+    def _subscribe(self, period_type: PeriodType, symbols: frozenset[str]) -> None: ...
 
     def _on_event(self, event: _EventBase) -> None:
         match event:
@@ -269,11 +278,11 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
                 self._connect()
 
 
-class IndicatorBase:
+class _IndicatorBase(ABC):
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
         self._history: dict[str, deque[float]] = {}
-        self._input_indicators: dict[str, "IndicatorBase"] = {}
+        self._input_indicators: dict[str, "_IndicatorBase"] = {}
 
     @property
     @abstractmethod
@@ -282,7 +291,7 @@ class IndicatorBase:
     @abstractmethod
     def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
 
-    def add_indicator(self, indicator: "IndicatorBase") -> "IndicatorBase":
+    def add_indicator(self, indicator: "_IndicatorBase") -> "_IndicatorBase":
         self._input_indicators[indicator.name] = indicator
         return indicator
 
@@ -317,7 +326,142 @@ class StrategyBase(_ComponentBase):
         Events.Broker.OrderExpired,
     )
 
+    SYMBOLS: frozenset[str] = frozenset()
+    PERIOD_TYPE: PeriodType = PeriodType.SECOND
+
+    def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
+        super().__init__(event_bus)
+
+        self._indicators: dict[str, _IndicatorBase] = {}
+        self._current_bar: Events.Datafeed.Bar | None = None
+
+        self._working_orders: dict[UUID, WorkingOrder] = {}
+        self._open_positions: dict[str, OpenPosition] = {}
+
+        self.setup()
+        self.emit(
+            Events.Strategy.StreamRequest(
+                period_type=self.PERIOD_TYPE, symbols=frozenset(self.SYMBOLS)
+            )
+        )
+
+    @abstractmethod
+    def setup(self): ...
+
+    def add_indicator(self, indicator: _IndicatorBase) -> _IndicatorBase:
+        self._indicators[indicator.name] = indicator
+        return indicator  # for inline assignment: `self.sma = self.add_indicator(...)`
+
+    @abstractmethod
+    def on_bar(self, event: Events.Datafeed.Bar) -> None: ...
+
+    # TODO
+    def submit_order(self):
+        pass
+
+    # TODO
+    def submit_modification(self):
+        pass
+
+    # TODO
+    def submit_cancel(self):
+        pass
+
     def _on_event(self, event: _EventBase) -> None:
+        # fmt: off
+        match event:
+            case Events.Datafeed.Bar()                  as event:
+                self._on_bar(event)
+
+            case Events.Broker.BrokerConnected()        as event:
+                self._on_broker_connected(event)
+
+            case Events.Broker.OrderAccepted()          as event:
+                self._on_order_accepted(event)
+
+            case Events.Broker.OrderRejected()          as event:
+                self._on_order_rejected(event)
+
+            case Events.Broker.ModificationAccepted()   as event:
+                self._on_modification_accepted(event)
+
+            case Events.Broker.ModificationRejected()   as event:
+                self._on_modification_rejected(event)
+
+            case Events.Broker.CancellationAccepted()   as event:
+                self._on_cancellation_accepted(event)
+
+            case Events.Broker.CancellationRejected()   as event:
+                self._on_cancellation_rejected(event)
+
+            case Events.Broker.Fill()                   as event:
+                self._on_fill(event)
+
+            case Events.Broker.OrderExpired()           as event:
+                self._on_order_expired(event)
+        # fmt: on
+
+    def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
+        self._current_bar = bar
+
+        for indicator in self._indicators.values():
+            indicator.update(bar)
+
+        self.on_bar(bar)
+
+        self.emit(
+            Events.Strategy.IndicatorUpdate(
+                symbol=bar.symbol,
+                source_event=bar,
+                ind_values={
+                    name: indicator.latest(bar.symbol)
+                    for name, indicator in self._indicators.items()
+                },
+            )
+        )
+
+    def _on_broker_connected(self, event: Events.Broker.BrokerConnected) -> None:
+        self._working_orders = event.working_orders
+        self._open_positions = event.open_positions
+
+    # TODO
+    def _on_order_accepted(self, event: Events.Broker.OrderAccepted) -> None:
+        pass
+
+    # TODO
+    def _on_order_rejected(self, event: Events.Broker.OrderRejected) -> None:
+        pass
+
+    # TODO
+    def _on_modification_accepted(
+        self, event: Events.Broker.ModificationAccepted
+    ) -> None:
+        pass
+
+    # TODO
+    def _on_modification_rejected(
+        self, event: Events.Broker.ModificationRejected
+    ) -> None:
+        pass
+
+    # TODO
+    def _on_cancellation_accepted(
+        self, event: Events.Broker.CancellationAccepted
+    ) -> None:
+        pass
+
+    # TODO
+    def _on_cancellation_rejected(
+        self, event: Events.Broker.CancellationRejected
+    ) -> None:
+        pass
+
+    # TODO
+    def _on_fill(self, event: Events.Broker.Fill) -> None:
+        pass
+
+    # TODO
+    def _on_order_expired(self, event: Events.Broker.OrderExpired) -> None:
         pass
 
 
@@ -340,7 +484,9 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
         )
 
     @abstractmethod
-    def _exposure_snapshot(self) -> tuple[list[WorkingOrder], list[OpenPosition]]: ...
+    def _exposure_snapshot(
+        self,
+    ) -> tuple[dict[UUID, WorkingOrder], dict[str, OpenPosition]]: ...
 
     def _on_event(self, event: _EventBase) -> None:
         match event:
