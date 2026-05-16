@@ -1,12 +1,12 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from queue import Queue
 from threading import Thread
 from time import time_ns
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 PRICE_SCALE_FACTOR = 1_000_000_000
 
@@ -44,6 +44,7 @@ class WorkingOrder:
     order_id:       UUID
     trade_side:     TradeSide
     quantity:       int
+    filled_qty:     int
     time_in_force:  TimeInForce
     limit_price:    ScaledPrice | None = None
     stop_price:     ScaledPrice | None = None
@@ -107,16 +108,8 @@ class Events:
             stop_price:     ScaledPrice | None = None
             # fmt: on
 
-        @dataclass(frozen=True, kw_only=True)
-        class ModifyOrder(_EventBase):
-            # fmt: off
-            symbol:         str
-            order_id:       UUID
-            quantity:       int
-            limit_price:    ScaledPrice | None = None
-            stop_price:     ScaledPrice | None = None
-            # fmt: on
-
+        # We do not modify orders, cancel and resubmit is the way. This significantly
+        # reduces the surface area of our system and reduces complexity.
         @dataclass(frozen=True, kw_only=True)
         class CancelOrder(_EventBase):
             # fmt: off
@@ -141,21 +134,6 @@ class Events:
 
         @dataclass(frozen=True, kw_only=True)
         class OrderRejected(_EventBase):
-            # fmt: off
-            symbol:         str
-            order_id:       UUID
-            reason:         str
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class ModificationAccepted(_EventBase):
-            # fmt: off
-            symbol:         str
-            order_id:       UUID
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class ModificationRejected(_EventBase):
             # fmt: off
             symbol:         str
             order_id:       UUID
@@ -286,7 +264,7 @@ class _IndicatorBase(ABC):
 
     @property
     @abstractmethod
-    def name(self) -> str: ...
+    def name(self) -> str: ...  # use f-string to put parameters in indicator name
 
     @abstractmethod
     def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
@@ -318,8 +296,6 @@ class StrategyBase(_ComponentBase):
         Events.Broker.BrokerConnected,
         Events.Broker.OrderAccepted,
         Events.Broker.OrderRejected,
-        Events.Broker.ModificationAccepted,
-        Events.Broker.ModificationRejected,
         Events.Broker.CancellationAccepted,
         Events.Broker.CancellationRejected,
         Events.Broker.Fill,
@@ -338,6 +314,10 @@ class StrategyBase(_ComponentBase):
         self._working_orders: dict[UUID, WorkingOrder] = {}
         self._open_positions: dict[str, OpenPosition] = {}
 
+        # In-flight requests awaiting broker acknowledgement.
+        self._submitted_orders: dict[UUID, Events.Strategy.SubmitOrder] = {}
+        self._submitted_cancellations: dict[UUID, Events.Strategy.CancelOrder] = {}
+
         self.setup()
         self.emit(
             Events.Strategy.StreamRequest(
@@ -346,7 +326,7 @@ class StrategyBase(_ComponentBase):
         )
 
     @abstractmethod
-    def setup(self): ...
+    def setup(self) -> None: ...
 
     def add_indicator(self, indicator: _IndicatorBase) -> _IndicatorBase:
         self._indicators[indicator.name] = indicator
@@ -355,17 +335,41 @@ class StrategyBase(_ComponentBase):
     @abstractmethod
     def on_bar(self, event: Events.Datafeed.Bar) -> None: ...
 
-    # TODO
-    def submit_order(self):
-        pass
+    def submit_order(
+        self,
+        trade_side: TradeSide,
+        quantity: int,
+        symbol: str | None = None,
+        time_in_force: TimeInForce = TimeInForce.GTC,
+        limit_price: int | None = None,
+        stop_price: int | None = None,
+    ) -> UUID:
+        if self._current_bar is None:
+            raise RuntimeError()
+        order_id: UUID = uuid4()
+        order_submission_event = Events.Strategy.SubmitOrder(
+            symbol=symbol if symbol is not None else self._current_bar.symbol,
+            order_id=order_id,
+            trade_side=trade_side,
+            quantity=quantity,
+            time_in_force=time_in_force,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+        self._submitted_orders[order_id] = order_submission_event
+        self.emit(order_submission_event)
+        return order_id
 
-    # TODO
-    def submit_modification(self):
-        pass
-
-    # TODO
-    def submit_cancel(self):
-        pass
+    def submit_cancel(self, order_id: UUID) -> None:
+        current_working_order = self._working_orders[order_id]
+        order_cancellation_event = Events.Strategy.CancelOrder(
+            symbol=current_working_order.symbol,
+            order_id=current_working_order.order_id,
+        )
+        self._submitted_cancellations[current_working_order.order_id] = (
+            order_cancellation_event
+        )
+        self.emit(order_cancellation_event)
 
     def _on_event(self, event: _EventBase) -> None:
         # fmt: off
@@ -382,12 +386,6 @@ class StrategyBase(_ComponentBase):
             case Events.Broker.OrderRejected()          as event:
                 self._on_order_rejected(event)
 
-            case Events.Broker.ModificationAccepted()   as event:
-                self._on_modification_accepted(event)
-
-            case Events.Broker.ModificationRejected()   as event:
-                self._on_modification_rejected(event)
-
             case Events.Broker.CancellationAccepted()   as event:
                 self._on_cancellation_accepted(event)
 
@@ -401,20 +399,17 @@ class StrategyBase(_ComponentBase):
                 self._on_order_expired(event)
         # fmt: on
 
-    def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
-        self._current_bar = bar
-
+    def _on_bar(self, event: Events.Datafeed.Bar) -> None:
+        self._current_bar = event
         for indicator in self._indicators.values():
-            indicator.update(bar)
-
-        self.on_bar(bar)
-
+            indicator.update(event)
+        self.on_bar(event)
         self.emit(
             Events.Strategy.IndicatorUpdate(
-                symbol=bar.symbol,
-                source_event=bar,
+                symbol=event.symbol,
+                source_event=event,
                 ind_values={
-                    name: indicator.latest(bar.symbol)
+                    name: indicator.latest(event.symbol)
                     for name, indicator in self._indicators.items()
                 },
             )
@@ -424,51 +419,62 @@ class StrategyBase(_ComponentBase):
         self._working_orders = event.working_orders
         self._open_positions = event.open_positions
 
-    # TODO
     def _on_order_accepted(self, event: Events.Broker.OrderAccepted) -> None:
-        pass
+        order = self._submitted_orders.pop(event.order_id)
+        self._working_orders[event.order_id] = WorkingOrder(
+            symbol=order.symbol,
+            order_id=order.order_id,
+            trade_side=order.trade_side,
+            quantity=order.quantity,
+            filled_qty=0,
+            time_in_force=order.time_in_force,
+            stop_price=order.stop_price,
+            limit_price=order.limit_price,
+        )
 
-    # TODO
     def _on_order_rejected(self, event: Events.Broker.OrderRejected) -> None:
-        pass
+        self._submitted_orders.pop(event.order_id)
 
-    # TODO
-    def _on_modification_accepted(
-        self, event: Events.Broker.ModificationAccepted
-    ) -> None:
-        pass
-
-    # TODO
-    def _on_modification_rejected(
-        self, event: Events.Broker.ModificationRejected
-    ) -> None:
-        pass
-
-    # TODO
     def _on_cancellation_accepted(
         self, event: Events.Broker.CancellationAccepted
     ) -> None:
-        pass
+        self._submitted_cancellations.pop(event.order_id)
+        self._working_orders.pop(event.order_id)
 
-    # TODO
     def _on_cancellation_rejected(
         self, event: Events.Broker.CancellationRejected
     ) -> None:
-        pass
+        self._submitted_cancellations.pop(event.order_id, None)
 
-    # TODO
     def _on_fill(self, event: Events.Broker.Fill) -> None:
-        pass
+        order = self._working_orders[event.order_id]
 
-    # TODO
+        if order.quantity - order.filled_qty - event.filled_qty:  # partial fill
+            self._working_orders[event.order_id] = replace(
+                order, filled_qty=order.filled_qty + event.filled_qty
+            )
+        else:  # full fill
+            self._working_orders.pop(event.order_id)
+            self._submitted_cancellations.pop(event.order_id, None)
+
+        # Update position tracking for symbol; fill event carries source of truth
+        if event.signed_position_size == 0:
+            self._open_positions.pop(event.symbol)
+        else:
+            self._open_positions[event.symbol] = OpenPosition(
+                symbol=event.symbol,
+                signed_qty=event.signed_position_size,
+                cost_basis=event.position_cost_basis,
+            )
+
     def _on_order_expired(self, event: Events.Broker.OrderExpired) -> None:
-        pass
+        self._working_orders.pop(event.order_id)
+        self._submitted_cancellations.pop(event.order_id, None)
 
 
 class BrokerConnectorBase(_ComponentBase, _Connectable):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
         Events.Strategy.SubmitOrder,
-        Events.Strategy.ModifyOrder,
         Events.Strategy.CancelOrder,
     )
 
@@ -492,16 +498,11 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
         match event:
             case Events.Strategy.SubmitOrder() as event:
                 self._on_submit_order(event)
-            case Events.Strategy.ModifyOrder() as event:
-                self._on_modify_order(event)
             case Events.Strategy.CancelOrder() as event:
                 self._on_cancel_order(event)
 
     @abstractmethod
     def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None: ...
-
-    @abstractmethod
-    def _on_modify_order(self, event: Events.Strategy.ModifyOrder) -> None: ...
 
     @abstractmethod
     def _on_cancel_order(self, event: Events.Strategy.CancelOrder) -> None: ...
