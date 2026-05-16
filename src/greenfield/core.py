@@ -1,12 +1,18 @@
+import json
+
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace, asdict
 from enum import Enum, auto
+from io import TextIOWrapper
+from pathlib import Path
 from queue import Queue
 from threading import Thread
 from time import time_ns
 from typing import Protocol
 from uuid import UUID, uuid4
+
+RUNS_DIR = Path("runs")
 
 PRICE_SCALE_FACTOR = 1_000_000_000
 
@@ -215,7 +221,7 @@ class _ComponentBase(_ComponentLike, ABC):
     def emit(self, event: _EventBase) -> None:
         self._event_bus.publish(event)
 
-    def _event_loop(self):
+    def _event_loop(self) -> None:
         while True:
             event = self._queue.get()
             if event is None:
@@ -237,6 +243,35 @@ class _Connectable(ABC):
 
 
 class RecorderBase(_ComponentBase, ABC): ...
+
+
+class JSONLRecorder(RecorderBase):
+    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(_EventBase.__subclasses__())
+
+    def __init__(self) -> None:
+        self._run_id: str = str(uuid4())
+        self._path: Path = RUNS_DIR / f"{self._run_id}.jsonl"
+        self._jsonl_file: TextIOWrapper | None = None
+        super().__init__()  # attributes must exist before starting thread
+
+    def _event_loop(self) -> None:
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        self._jsonl_file = open(self._path, "a")
+        try:
+            super()._event_loop()
+        finally:
+            if self._jsonl_file is not None:
+                self._jsonl_file.close()
+
+    def _on_event(self, event: _EventBase) -> None:
+        assert self._jsonl_file is not None
+        record = {
+            "run_id": self._run_id,
+            "event_type": type(event).__qualname__,
+            "data": asdict(event),
+        }
+        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
+        self._jsonl_file.flush()
 
 
 class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
@@ -361,14 +396,12 @@ class StrategyBase(_ComponentBase):
         return order_id
 
     def submit_cancel(self, order_id: UUID) -> None:
-        current_working_order = self._working_orders[order_id]
+        working_order = self._working_orders[order_id]
         order_cancellation_event = Events.Strategy.CancelOrder(
-            symbol=current_working_order.symbol,
-            order_id=current_working_order.order_id,
+            symbol=working_order.symbol,
+            order_id=working_order.order_id,
         )
-        self._submitted_cancellations[current_working_order.order_id] = (
-            order_cancellation_event
-        )
+        self._submitted_cancellations[working_order.order_id] = order_cancellation_event
         self.emit(order_cancellation_event)
 
     def _on_event(self, event: _EventBase) -> None:
@@ -378,25 +411,28 @@ class StrategyBase(_ComponentBase):
                 self._on_bar(event)
 
             case Events.Broker.BrokerConnected()        as event:
-                self._on_broker_connected(event)
+                self._working_orders = event.working_orders
+                self._open_positions = event.open_positions
 
             case Events.Broker.OrderAccepted()          as event:
                 self._on_order_accepted(event)
 
             case Events.Broker.OrderRejected()          as event:
-                self._on_order_rejected(event)
+                self._submitted_orders.pop(event.order_id)
 
             case Events.Broker.CancellationAccepted()   as event:
-                self._on_cancellation_accepted(event)
+                self._submitted_cancellations.pop(event.order_id)
+                self._working_orders.pop(event.order_id)
 
             case Events.Broker.CancellationRejected()   as event:
-                self._on_cancellation_rejected(event)
+                self._submitted_cancellations.pop(event.order_id, None)
 
             case Events.Broker.Fill()                   as event:
                 self._on_fill(event)
 
             case Events.Broker.OrderExpired()           as event:
-                self._on_order_expired(event)
+                self._working_orders.pop(event.order_id)
+                self._submitted_cancellations.pop(event.order_id, None)
         # fmt: on
 
     def _on_bar(self, event: Events.Datafeed.Bar) -> None:
@@ -415,10 +451,6 @@ class StrategyBase(_ComponentBase):
             )
         )
 
-    def _on_broker_connected(self, event: Events.Broker.BrokerConnected) -> None:
-        self._working_orders = event.working_orders
-        self._open_positions = event.open_positions
-
     def _on_order_accepted(self, event: Events.Broker.OrderAccepted) -> None:
         order = self._submitted_orders.pop(event.order_id)
         self._working_orders[event.order_id] = WorkingOrder(
@@ -431,20 +463,6 @@ class StrategyBase(_ComponentBase):
             stop_price=order.stop_price,
             limit_price=order.limit_price,
         )
-
-    def _on_order_rejected(self, event: Events.Broker.OrderRejected) -> None:
-        self._submitted_orders.pop(event.order_id)
-
-    def _on_cancellation_accepted(
-        self, event: Events.Broker.CancellationAccepted
-    ) -> None:
-        self._submitted_cancellations.pop(event.order_id)
-        self._working_orders.pop(event.order_id)
-
-    def _on_cancellation_rejected(
-        self, event: Events.Broker.CancellationRejected
-    ) -> None:
-        self._submitted_cancellations.pop(event.order_id, None)
 
     def _on_fill(self, event: Events.Broker.Fill) -> None:
         order = self._working_orders[event.order_id]
@@ -467,10 +485,6 @@ class StrategyBase(_ComponentBase):
                 cost_basis=event.position_cost_basis,
             )
 
-    def _on_order_expired(self, event: Events.Broker.OrderExpired) -> None:
-        self._working_orders.pop(event.order_id)
-        self._submitted_cancellations.pop(event.order_id, None)
-
 
 class BrokerConnectorBase(_ComponentBase, _Connectable):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
@@ -478,7 +492,7 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
         Events.Strategy.CancelOrder,
     )
 
-    def __init__(self, event_bus: _EventBus = _system_event_bus):
+    def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
         self._connect()
         working_orders, open_positions = self._exposure_snapshot()
