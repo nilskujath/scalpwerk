@@ -1,3 +1,4 @@
+import csv
 import json
 
 from abc import ABC, abstractmethod
@@ -20,12 +21,12 @@ type NanosecondsSinceUnixEpoch = int
 type ScaledPrice = int
 
 
-class PeriodType(Enum):
+class PeriodType(Enum):  # values for easy compatibility with Databento schema
     # fmt: off
-    SECOND  = auto()
-    MINUTE  = auto()
-    HOUR    = auto()
-    DAY     = auto()
+    SECOND  = 32
+    MINUTE  = 33
+    HOUR    = 34
+    DAY     = 35
     # fmt: on
 
 
@@ -69,6 +70,11 @@ class OpenPosition:
 @dataclass(frozen=True, kw_only=True)
 class _EventBase:
     timestamp: NanosecondsSinceUnixEpoch = field(default_factory=lambda: time_ns())
+
+
+@dataclass(frozen=True, kw_only=True)
+class _SystemShutdown(_EventBase):
+    pass
 
 
 class Events:
@@ -205,12 +211,20 @@ class _EventBus:
 _system_event_bus = _EventBus()
 
 
+class _Connectable(ABC):
+    @abstractmethod
+    def _connect(self) -> None: ...
+
+    @abstractmethod
+    def _disconnect(self) -> None: ...
+
+
 class _ComponentBase(_ComponentLike, ABC):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = ()
 
     def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
         self._event_bus: _EventBus = event_bus
-        self._event_bus.subscribe(self, *self.SUBSCRIBE_TO)
+        self._event_bus.subscribe(self, *self.SUBSCRIBE_TO, _SystemShutdown)
         self._queue: Queue[_EventBase] = Queue()
         self._thread: Thread = Thread(target=self._event_loop, name=type(self).__name__)
         self._thread.start()
@@ -224,29 +238,25 @@ class _ComponentBase(_ComponentLike, ABC):
     def _event_loop(self) -> None:
         while True:
             event = self._queue.get()
-            if event is None:
+            if isinstance(event, _SystemShutdown):
                 self._queue.task_done()
                 break
             self._on_event(event)
             self._queue.task_done()
+        if isinstance(self, _Connectable):
+            self._disconnect()
 
     @abstractmethod
     def _on_event(self, event: _EventBase) -> None: ...
-
-
-class _Connectable(ABC):
-    @abstractmethod
-    def _connect(self) -> None: ...
-
-    @abstractmethod
-    def _disconnect(self) -> None: ...
 
 
 class RecorderBase(_ComponentBase, ABC): ...
 
 
 class JSONLRecorder(RecorderBase):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(_EventBase.__subclasses__())
+    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(
+        cls for cls in _EventBase.__subclasses__() if cls is not _SystemShutdown
+    )
 
     def __init__(self) -> None:
         self._run_id: str = str(uuid4())
@@ -288,7 +298,49 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
             case Events.Strategy.StreamRequest() as event:
                 self._subscribe(period_type=event.period_type, symbols=event.symbols)
             case Events.Broker.BrokerConnected():
-                self._connect()
+                self._connect()  # connect datafeed only after broker is connected
+
+
+class CSVDatafeedConnector(DatafeedConnectorBase):
+    def __init__(self, csv_path: Path) -> None:
+        self._csv_path = csv_path
+        self._symbols: frozenset[str] = frozenset()
+        super().__init__()
+
+    def _subscribe(self, period_type: PeriodType, symbols: frozenset[str]) -> None:
+        self._symbols |= symbols
+
+    def _connect(self) -> None:
+        with open(self._csv_path) as f:
+            column_names = next(csv.reader(f))
+            idx = {name: i for i, name in enumerate(column_names)}
+            i_sym, i_ts, i_rt = idx["symbol"], idx["ts_event"], idx["rtype"]
+            i_o, i_h, i_l, i_c, i_v = (
+                idx["open"],
+                idx["high"],
+                idx["low"],
+                idx["close"],
+                idx["volume"],
+            )
+            for row in csv.reader(f):
+                if row[i_sym] not in self._symbols:
+                    continue
+                self.emit(
+                    Events.Datafeed.Bar(
+                        symbol=row[i_sym],
+                        period_start=int(row[i_ts]),
+                        period_type=PeriodType(int(row[i_rt])),
+                        open=int(row[i_o]),
+                        high=int(row[i_h]),
+                        low=int(row[i_l]),
+                        close=int(row[i_c]),
+                        volume=int(row[i_v]) if row[i_v] else None,
+                    )
+                )
+        self.emit(_SystemShutdown())  # initiate system shutdown at EOF
+
+    def _disconnect(self) -> None:
+        pass
 
 
 class _IndicatorBase(ABC):
@@ -317,12 +369,85 @@ class _IndicatorBase(ABC):
     def latest(self, symbol: str) -> float:
         return self[symbol, -1]
 
+    def get_history(self, symbol: str) -> deque[float] | None:
+        return self._history.get(symbol)
+
     def __getitem__(self, key: tuple[str, int]) -> float:  # `self.sma["ES", -1]`
         symbol, index = key
         try:
             return self._history[symbol][index]
         except (KeyError, IndexError):
             return float("nan")
+
+
+class Open(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Open"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.open
+
+
+class High(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "High"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.high
+
+
+class Low(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Low"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.low
+
+
+class Close(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Close"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.close
+
+
+class Volume(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Volume"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return float(bar.volume) if bar.volume is not None else float("nan")
+
+
+class SimpleMovingAverage(_IndicatorBase):
+    def __init__(self, window_length: int, source: _IndicatorBase) -> None:
+        super().__init__()
+        self._window_length: int = window_length
+        self._source_indicator: _IndicatorBase = self.add_indicator(source)
+
+    @property
+    def name(self) -> str:
+        return f"SMA_{self._window_length}_{self._source_indicator.name}"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        source_indicator_history: deque[float] | None = (
+            self._source_indicator.get_history(bar.symbol)
+        )
+        if (
+            source_indicator_history is None
+            or len(source_indicator_history) < self._window_length
+        ):
+            return float("nan")
+        return (
+            sum(source_indicator_history[i] for i in range(-self._window_length, 0))
+            / self._window_length
+        )
 
 
 class StrategyBase(_ComponentBase):
@@ -356,7 +481,7 @@ class StrategyBase(_ComponentBase):
         self.setup()
         self.emit(
             Events.Strategy.StreamRequest(
-                period_type=self.PERIOD_TYPE, symbols=frozenset(self.SYMBOLS)
+                period_type=self.PERIOD_TYPE, symbols=self.SYMBOLS
             )
         )
 
@@ -436,6 +561,8 @@ class StrategyBase(_ComponentBase):
         # fmt: on
 
     def _on_bar(self, event: Events.Datafeed.Bar) -> None:
+        if event.symbol not in self.SYMBOLS or event.period_type != self.PERIOD_TYPE:
+            return
         self._current_bar = event
         for indicator in self._indicators.values():
             indicator.update(event)
@@ -523,7 +650,8 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
 
 
 if __name__ == "__main__":
-    dummy_recorder = ...
-    dummy_datafeed = ...
+    recorder = JSONLRecorder()
+    datafeed = CSVDatafeedConnector(csv_path=Path(""))
+
     dummy_strategy = ...
     dummy_broker = ...
