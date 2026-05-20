@@ -19,6 +19,9 @@ PRICE_SCALE_FACTOR = 1_000_000_000
 
 type NanosecondsSinceUnixEpoch = int
 type ScaledPrice = int
+type Symbol = str
+type Quantity = int
+type SignedQuantity = int  # positive if long, negative if short
 
 
 class PeriodType(Enum):  # values for easy compatibility with Databento schema
@@ -27,6 +30,15 @@ class PeriodType(Enum):  # values for easy compatibility with Databento schema
     MINUTE  = 33
     HOUR    = 34
     DAY     = 35
+    # fmt: on
+
+
+class OrderType(Enum):
+    # fmt: off
+    MARKET      = auto()
+    STOP        = auto()
+    STOP_LIMIT  = auto()
+    LIMIT       = auto()
     # fmt: on
 
 
@@ -47,11 +59,12 @@ class TimeInForce(Enum):
 @dataclass(frozen=True, kw_only=True)
 class WorkingOrder:
     # fmt: off
-    symbol:         str
+    symbol:         Symbol
     order_id:       UUID
+    order_type:     OrderType
     trade_side:     TradeSide
-    quantity:       int
-    filled_qty:     int
+    qty:            Quantity
+    filled_qty:     Quantity
     time_in_force:  TimeInForce
     limit_price:    ScaledPrice | None = None
     stop_price:     ScaledPrice | None = None
@@ -61,8 +74,8 @@ class WorkingOrder:
 @dataclass(frozen=True, kw_only=True)
 class OpenPosition:
     # fmt: off
-    symbol:         str
-    signed_qty:     int
+    symbol:         Symbol
+    signed_qty:     Quantity
     cost_basis:     ScaledPrice
     # fmt: on
 
@@ -82,7 +95,7 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class Bar(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             period_start:   NanosecondsSinceUnixEpoch
             period_type:    PeriodType
             open:           ScaledPrice
@@ -97,13 +110,13 @@ class Events:
         class StreamRequest(_EventBase):
             # fmt: off
             period_type:    PeriodType
-            symbols:        frozenset[str]
+            symbols:        frozenset[Symbol]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
         class IndicatorUpdate(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             source_event:   "Events.Datafeed.Bar"
             ind_values:     dict[str, float]
             # fmt: on
@@ -111,10 +124,11 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class SubmitOrder(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
+            order_type:     OrderType
             trade_side:     TradeSide
-            quantity:       int
+            qty:            Quantity
             time_in_force:  TimeInForce
             limit_price:    ScaledPrice | None = None
             stop_price:     ScaledPrice | None = None
@@ -125,7 +139,7 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class CancelOrder(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             # fmt: on
 
@@ -134,20 +148,20 @@ class Events:
         class BrokerConnected(_EventBase):
             # fmt: off
             working_orders: dict[UUID, WorkingOrder]
-            open_positions: dict[str, OpenPosition]
+            open_positions: dict[Symbol, OpenPosition]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
         class OrderAccepted(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
         class OrderRejected(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             reason:         str
             # fmt: on
@@ -155,14 +169,14 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class CancellationAccepted(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
         class CancellationRejected(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             reason:         str
             # fmt: on
@@ -171,22 +185,22 @@ class Events:
         class Fill(_EventBase):
             # fmt: off
             # fill information
-            symbol:         str
+            symbol:         Symbol
             fill_id:        UUID
             order_id:       UUID
             trade_side:     TradeSide
-            filled_qty:     int
+            filled_qty:     Quantity
             fill_price:     ScaledPrice
 
             # position state after this fill
             signed_position_size:   int
-            position_cost_basis:    ScaledPrice
+            position_cost_basis:    ScaledPrice | None = None  # if fill flattens pos
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
         class OrderExpired(_EventBase):
             # fmt: off
-            symbol:         str
+            symbol:         Symbol
             order_id:       UUID
             # fmt: on
 
@@ -291,7 +305,9 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
     )
 
     @abstractmethod
-    def _subscribe(self, period_type: PeriodType, symbols: frozenset[str]) -> None: ...
+    def _subscribe(
+        self, period_type: PeriodType, symbols: frozenset[Symbol]
+    ) -> None: ...
 
     def _on_event(self, event: _EventBase) -> None:
         match event:
@@ -304,10 +320,10 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
 class CSVDatafeedConnector(DatafeedConnectorBase):
     def __init__(self, csv_path: Path) -> None:
         self._csv_path = csv_path
-        self._symbols: frozenset[str] = frozenset()
+        self._symbols: frozenset[Symbol] = frozenset()
         super().__init__()
 
-    def _subscribe(self, period_type: PeriodType, symbols: frozenset[str]) -> None:
+    def _subscribe(self, period_type: PeriodType, symbols: frozenset[Symbol]) -> None:
         self._symbols |= symbols
 
     def _connect(self) -> None:
@@ -343,6 +359,7 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
         pass
 
 
+# TODO It should return int (?)
 class _IndicatorBase(ABC):
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
@@ -366,13 +383,13 @@ class _IndicatorBase(ABC):
         history = self._history.setdefault(bar.symbol, deque(maxlen=self._max_history))
         history.append(self._compute(bar))
 
-    def latest(self, symbol: str) -> float:
+    def latest(self, symbol: Symbol) -> float:
         return self[symbol, -1]
 
-    def get_history(self, symbol: str) -> deque[float] | None:
+    def get_history(self, symbol: Symbol) -> deque[float] | None:
         return self._history.get(symbol)
 
-    def __getitem__(self, key: tuple[str, int]) -> float:  # `self.sma["ES", -1]`
+    def __getitem__(self, key: tuple[Symbol, int]) -> float:  # `self.sma["ES", -1]`
         symbol, index = key
         try:
             return self._history[symbol][index]
@@ -462,7 +479,7 @@ class StrategyBase(_ComponentBase):
         Events.Broker.OrderExpired,
     )
 
-    SYMBOLS: frozenset[str] = frozenset()
+    SYMBOLS: frozenset[Symbol] = frozenset()
     PERIOD_TYPE: PeriodType = PeriodType.SECOND
 
     def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
@@ -497,12 +514,13 @@ class StrategyBase(_ComponentBase):
 
     def submit_order(
         self,
+        order_type: OrderType,
         trade_side: TradeSide,
-        quantity: int,
-        symbol: str | None = None,
+        qty: Quantity,
+        symbol: Symbol | None = None,
         time_in_force: TimeInForce = TimeInForce.GTC,
-        limit_price: int | None = None,
-        stop_price: int | None = None,
+        limit_price: ScaledPrice | None = None,
+        stop_price: ScaledPrice | None = None,
     ) -> UUID:
         if self._current_bar is None:
             raise RuntimeError()
@@ -510,8 +528,9 @@ class StrategyBase(_ComponentBase):
         order_submission_event = Events.Strategy.SubmitOrder(
             symbol=symbol if symbol is not None else self._current_bar.symbol,
             order_id=order_id,
+            order_type=order_type,
             trade_side=trade_side,
-            quantity=quantity,
+            qty=qty,
             time_in_force=time_in_force,
             limit_price=limit_price,
             stop_price=stop_price,
@@ -583,8 +602,9 @@ class StrategyBase(_ComponentBase):
         self._working_orders[event.order_id] = WorkingOrder(
             symbol=order.symbol,
             order_id=order.order_id,
+            order_type=order.order_type,
             trade_side=order.trade_side,
-            quantity=order.quantity,
+            qty=order.qty,
             filled_qty=0,
             time_in_force=order.time_in_force,
             stop_price=order.stop_price,
@@ -594,7 +614,7 @@ class StrategyBase(_ComponentBase):
     def _on_fill(self, event: Events.Broker.Fill) -> None:
         order = self._working_orders[event.order_id]
 
-        if order.quantity - order.filled_qty - event.filled_qty:  # partial fill
+        if order.qty - order.filled_qty - event.filled_qty:  # partial fill
             self._working_orders[event.order_id] = replace(
                 order, filled_qty=order.filled_qty + event.filled_qty
             )
@@ -606,6 +626,7 @@ class StrategyBase(_ComponentBase):
         if event.signed_position_size == 0:
             self._open_positions.pop(event.symbol)
         else:
+            assert event.position_cost_basis is not None
             self._open_positions[event.symbol] = OpenPosition(
                 symbol=event.symbol,
                 signed_qty=event.signed_position_size,
@@ -633,7 +654,7 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
     @abstractmethod
     def _exposure_snapshot(
         self,
-    ) -> tuple[dict[UUID, WorkingOrder], dict[str, OpenPosition]]: ...
+    ) -> tuple[dict[UUID, WorkingOrder], dict[Symbol, OpenPosition]]: ...
 
     def _on_event(self, event: _EventBase) -> None:
         match event:
@@ -647,6 +668,237 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
 
     @abstractmethod
     def _on_cancel_order(self, event: Events.Strategy.CancelOrder) -> None: ...
+
+
+class SimulatedBrokerConnector(BrokerConnectorBase):
+    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
+        Events.Strategy.SubmitOrder,
+        Events.Strategy.CancelOrder,
+        Events.Datafeed.Bar,  # also subscribe to bars for order matching
+    )
+
+    # fmt: off
+    COMMISSION_PER_UNIT:        float = 0.0
+    MIN_COMMISSION_PER_ORDER:   float = 0.0
+    # fmt: on
+
+    def __init__(self) -> None:
+        self._working_orders: dict[UUID, WorkingOrder] = {}  # incl. market orders
+        self._open_entries: dict[Symbol, deque[tuple[SignedQuantity, ScaledPrice]]] = {}
+        super().__init__()
+
+    def _connect(self) -> None:
+        pass
+
+    def _disconnect(self) -> None:
+        pass
+
+    def _exposure_snapshot(
+        self,
+    ) -> tuple[dict[UUID, WorkingOrder], dict[Symbol, OpenPosition]]:
+        return self._working_orders.copy(), {
+            symbol: OpenPosition(
+                symbol=symbol,
+                signed_qty=sum(qty for qty, _ in open_entries),
+                cost_basis=(
+                    sum(qty * price for qty, price in open_entries)
+                    // sum(qty for qty, _ in open_entries)
+                ),
+            )
+            for symbol, open_entries in self._open_entries.items()
+        }
+
+    def _on_event(self, event: _EventBase) -> None:
+        if isinstance(event, Events.Datafeed.Bar):
+            self._on_bar(event)
+        else:
+            super()._on_event(event)
+
+    def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None:
+        self._working_orders[event.order_id] = WorkingOrder(
+            symbol=event.symbol,
+            order_id=event.order_id,
+            order_type=event.order_type,
+            trade_side=event.trade_side,
+            qty=event.qty,
+            filled_qty=0,
+            time_in_force=event.time_in_force,
+            limit_price=event.limit_price,
+            stop_price=event.stop_price,
+        )
+        self.emit(
+            Events.Broker.OrderAccepted(
+                timestamp=event.timestamp,  # for charting purposes
+                symbol=event.symbol,
+                order_id=event.order_id,
+            )
+        )
+
+    def _on_cancel_order(self, event: Events.Strategy.CancelOrder) -> None:
+        if event.order_id in self._working_orders:
+            del self._working_orders[event.order_id]
+            self.emit(
+                Events.Broker.CancellationAccepted(
+                    timestamp=event.timestamp,
+                    symbol=event.symbol,
+                    order_id=event.order_id,
+                )
+            )
+
+    def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
+        for order in list(self._working_orders.values()):
+            if order.symbol != bar.symbol:
+                continue
+
+            match order.order_type:
+                case OrderType.MARKET:
+                    self._execute_order(order, bar.open, bar.period_start)
+
+                case OrderType.STOP:
+                    assert order.stop_price is not None
+                    if (
+                        order.trade_side is TradeSide.BUY
+                        and bar.high >= order.stop_price
+                    ):
+                        self._execute_order(
+                            order, max(order.stop_price, bar.open), bar.period_start
+                        )
+                    elif (
+                        order.trade_side is TradeSide.SELL
+                        and bar.low <= order.stop_price
+                    ):
+                        self._execute_order(
+                            order, min(order.stop_price, bar.open), bar.period_start
+                        )
+
+                case OrderType.STOP_LIMIT:
+                    assert (
+                        order.stop_price is not None and order.limit_price is not None
+                    )
+                    if (
+                        order.trade_side is TradeSide.BUY
+                        and bar.high >= order.stop_price
+                    ):
+                        limit_order = replace(
+                            order, order_type=OrderType.LIMIT, stop_price=None
+                        )
+                        self._working_orders[order.order_id] = limit_order
+                        if bar.low <= order.limit_price:
+                            self._execute_order(
+                                limit_order,
+                                min(order.limit_price, bar.open),
+                                bar.period_start,
+                            )
+                    elif (
+                        order.trade_side is TradeSide.SELL
+                        and bar.low <= order.stop_price
+                    ):
+                        limit_order = replace(
+                            order, order_type=OrderType.LIMIT, stop_price=None
+                        )
+                        self._working_orders[order.order_id] = limit_order
+                        if bar.high >= order.limit_price:
+                            self._execute_order(
+                                limit_order,
+                                max(order.limit_price, bar.open),
+                                bar.period_start,
+                            )
+
+                case OrderType.LIMIT:
+                    assert order.limit_price is not None
+                    if (
+                        order.trade_side is TradeSide.BUY
+                        and bar.low <= order.limit_price
+                    ):
+                        self._execute_order(
+                            order, min(order.limit_price, bar.open), bar.period_start
+                        )
+                    elif (
+                        order.trade_side is TradeSide.SELL
+                        and bar.high >= order.limit_price
+                    ):
+                        self._execute_order(
+                            order, max(order.limit_price, bar.open), bar.period_start
+                        )
+
+    def _execute_order(
+        self,
+        order: WorkingOrder,
+        fill_price: ScaledPrice,
+        fill_timestamp: NanosecondsSinceUnixEpoch,
+    ) -> None:
+
+        # Remove working order
+        del self._working_orders[order.order_id]
+
+        # Reconcile open entry tracking with fill (FIFO method)
+        signed_fill_qty: SignedQuantity = (
+            order.qty if order.trade_side is TradeSide.BUY else -order.qty
+        )
+        open_entries = self._open_entries.get(order.symbol, deque())
+        open_position_qty: SignedQuantity = sum(qty for qty, _ in open_entries)
+
+        # CASE: no position -> create first entry
+        if not open_entries:
+            self._open_entries[order.symbol] = deque([(signed_fill_qty, fill_price)])
+
+        # CASE: fill adds to position -> append new entry
+        elif open_position_qty * signed_fill_qty > 0:
+            open_entries.append((signed_fill_qty, fill_price))
+
+        # CASE: fill exactly closes position -> flatten
+        elif order.qty == abs(open_position_qty):
+            self._open_entries.pop(order.symbol, None)
+
+        # CASE: fill partially reduces position -> consume in FIFO order
+        elif order.qty < abs(open_position_qty):
+            qty_to_consume: Quantity = order.qty
+            while qty_to_consume > 0:
+                entry_qty, entry_price = open_entries[0]
+                if qty_to_consume >= abs(entry_qty):
+                    qty_to_consume -= abs(entry_qty)
+                    self._open_entries[order.symbol].popleft()
+                else:
+                    self._open_entries[order.symbol][0] = (
+                        (
+                            entry_qty - qty_to_consume
+                            if entry_qty > 0
+                            else entry_qty + qty_to_consume
+                        ),
+                        entry_price,
+                    )
+                    qty_to_consume = 0
+
+        # CASE: fill exceeds position -> flatten and open new position
+        elif order.qty > abs(open_position_qty):
+            self._open_entries.pop(order.symbol, None)
+            remaining: Quantity = order.qty - abs(open_position_qty)
+            remaining_signed: SignedQuantity = (
+                remaining if signed_fill_qty > 0 else -remaining
+            )
+            self._open_entries[order.symbol] = deque([(remaining_signed, fill_price)])
+
+        # Emit fill event
+        updated_open_entries = self._open_entries.get(order.symbol, deque())
+
+        self.emit(
+            Events.Broker.Fill(
+                timestamp=fill_timestamp,
+                symbol=order.symbol,
+                fill_id=uuid4(),
+                order_id=order.order_id,
+                trade_side=order.trade_side,
+                filled_qty=order.qty,
+                fill_price=fill_price,
+                signed_position_size=sum(q for q, _ in updated_open_entries),
+                position_cost_basis=(
+                    sum(q * p for q, p in updated_open_entries)
+                    // sum(q for q, _ in updated_open_entries)
+                    if updated_open_entries
+                    else None
+                ),
+            )
+        )
 
 
 if __name__ == "__main__":
