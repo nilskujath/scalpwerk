@@ -9,11 +9,9 @@ from io import TextIOWrapper
 from pathlib import Path
 from queue import Queue
 from threading import Thread
-from time import time_ns
+from time import time_ns, strftime, gmtime
 from typing import Protocol
 from uuid import UUID, uuid4
-
-RUNS_DIR = Path("runs")
 
 PRICE_SCALE_FACTOR = 1_000_000_000
 
@@ -46,6 +44,13 @@ class TradeSide(Enum):
     # fmt: off
     BUY     = auto()
     SELL    = auto()
+    # fmt: on
+
+
+class PositionDirection(Enum):
+    # fmt: off
+    LONG    = auto()
+    SHORT   = auto()
     # fmt: on
 
 
@@ -207,6 +212,10 @@ class Events:
 
 class _ComponentLike(Protocol):
     def receive(self, event: _EventBase) -> None: ...
+    @property
+    def is_idle(self) -> bool: ...
+    def wait_until_idle(self) -> None: ...
+    def wait_until_shutdown(self) -> None: ...
 
 
 class _EventBus:
@@ -220,6 +229,16 @@ class _EventBus:
     def publish(self, event: _EventBase):
         for component in self._subs[type(event)]:
             component.receive(event)
+
+    def wait_until_system_idle(self, exclude: _ComponentLike | None = None) -> None:
+        while True:
+            all_components = set().union(*self._subs.values())
+            if exclude is not None:
+                all_components.discard(exclude)
+            for component in all_components:
+                component.wait_until_idle()
+            if all(component.is_idle for component in all_components):
+                break
 
 
 _system_event_bus = _EventBus()
@@ -242,6 +261,19 @@ class _ComponentBase(_ComponentLike, ABC):
         self._queue: Queue[_EventBase] = Queue()
         self._thread: Thread = Thread(target=self._event_loop, name=type(self).__name__)
         self._thread.start()
+
+    @property
+    def is_idle(self) -> bool:
+        return self._queue.unfinished_tasks == 0
+
+    def wait_until_idle(self) -> None:
+        self._queue.join()
+
+    def _wait_until_system_idle(self) -> None:
+        self._event_bus.wait_until_system_idle(exclude=self)
+
+    def wait_until_shutdown(self) -> None:
+        self._thread.join()
 
     def receive(self, event: _EventBase) -> None:
         self._queue.put(event)
@@ -267,37 +299,6 @@ class _ComponentBase(_ComponentLike, ABC):
 class RecorderBase(_ComponentBase, ABC): ...
 
 
-class JSONLRecorder(RecorderBase):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(
-        cls for cls in _EventBase.__subclasses__() if cls is not _SystemShutdown
-    )
-
-    def __init__(self) -> None:
-        self._run_id: str = str(uuid4())
-        self._path: Path = RUNS_DIR / f"{self._run_id}.jsonl"
-        self._jsonl_file: TextIOWrapper | None = None
-        super().__init__()  # attributes must exist before starting thread
-
-    def _event_loop(self) -> None:
-        RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        self._jsonl_file = open(self._path, "a")
-        try:
-            super()._event_loop()
-        finally:
-            if self._jsonl_file is not None:
-                self._jsonl_file.close()
-
-    def _on_event(self, event: _EventBase) -> None:
-        assert self._jsonl_file is not None
-        record = {
-            "run_id": self._run_id,
-            "event_type": type(event).__qualname__,
-            "data": asdict(event),
-        }
-        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
-        self._jsonl_file.flush()
-
-
 class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
         Events.Strategy.StreamRequest,
@@ -315,48 +316,6 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
                 self._subscribe(period_type=event.period_type, symbols=event.symbols)
             case Events.Broker.BrokerConnected():
                 self._connect()  # connect datafeed only after broker is connected
-
-
-class CSVDatafeedConnector(DatafeedConnectorBase):
-    def __init__(self, csv_path: Path) -> None:
-        self._csv_path = csv_path
-        self._symbols: frozenset[Symbol] = frozenset()
-        super().__init__()
-
-    def _subscribe(self, period_type: PeriodType, symbols: frozenset[Symbol]) -> None:
-        self._symbols |= symbols
-
-    def _connect(self) -> None:
-        with open(self._csv_path) as f:
-            column_names = next(csv.reader(f))
-            idx = {name: i for i, name in enumerate(column_names)}
-            i_sym, i_ts, i_rt = idx["symbol"], idx["ts_event"], idx["rtype"]
-            i_o, i_h, i_l, i_c, i_v = (
-                idx["open"],
-                idx["high"],
-                idx["low"],
-                idx["close"],
-                idx["volume"],
-            )
-            for row in csv.reader(f):
-                if row[i_sym] not in self._symbols:
-                    continue
-                self.emit(
-                    Events.Datafeed.Bar(
-                        symbol=row[i_sym],
-                        period_start=int(row[i_ts]),
-                        period_type=PeriodType(int(row[i_rt])),
-                        open=int(row[i_o]),
-                        high=int(row[i_h]),
-                        low=int(row[i_l]),
-                        close=int(row[i_c]),
-                        volume=int(row[i_v]) if row[i_v] else None,
-                    )
-                )
-        self.emit(_SystemShutdown())  # initiate system shutdown at EOF
-
-    def _disconnect(self) -> None:
-        pass
 
 
 # TODO It should return int (?)
@@ -397,76 +356,6 @@ class _IndicatorBase(ABC):
             return float("nan")
 
 
-class Open(_IndicatorBase):
-    @property
-    def name(self) -> str:
-        return "Open"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        return bar.open
-
-
-class High(_IndicatorBase):
-    @property
-    def name(self) -> str:
-        return "High"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        return bar.high
-
-
-class Low(_IndicatorBase):
-    @property
-    def name(self) -> str:
-        return "Low"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        return bar.low
-
-
-class Close(_IndicatorBase):
-    @property
-    def name(self) -> str:
-        return "Close"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        return bar.close
-
-
-class Volume(_IndicatorBase):
-    @property
-    def name(self) -> str:
-        return "Volume"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        return float(bar.volume) if bar.volume is not None else float("nan")
-
-
-class SimpleMovingAverage(_IndicatorBase):
-    def __init__(self, window_length: int, source: _IndicatorBase) -> None:
-        super().__init__()
-        self._window_length: int = window_length
-        self._source_indicator: _IndicatorBase = self.add_indicator(source)
-
-    @property
-    def name(self) -> str:
-        return f"SMA_{self._window_length}_{self._source_indicator.name}"
-
-    def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        source_indicator_history: deque[float] | None = (
-            self._source_indicator.get_history(bar.symbol)
-        )
-        if (
-            source_indicator_history is None
-            or len(source_indicator_history) < self._window_length
-        ):
-            return float("nan")
-        return (
-            sum(source_indicator_history[i] for i in range(-self._window_length, 0))
-            / self._window_length
-        )
-
-
 class StrategyBase(_ComponentBase):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
         Events.Datafeed.Bar,
@@ -495,15 +384,11 @@ class StrategyBase(_ComponentBase):
         self._submitted_orders: dict[UUID, Events.Strategy.SubmitOrder] = {}
         self._submitted_cancellations: dict[UUID, Events.Strategy.CancelOrder] = {}
 
-        self.setup()
         self.emit(
             Events.Strategy.StreamRequest(
                 period_type=self.PERIOD_TYPE, symbols=self.SYMBOLS
             )
         )
-
-    @abstractmethod
-    def setup(self) -> None: ...
 
     def add_indicator(self, indicator: _IndicatorBase) -> _IndicatorBase:
         self._indicators[indicator.name] = indicator
@@ -511,6 +396,29 @@ class StrategyBase(_ComponentBase):
 
     @abstractmethod
     def on_bar(self, event: Events.Datafeed.Bar) -> None: ...
+
+    @property
+    def position(self) -> SignedQuantity:
+        if self._current_bar is None:
+            return 0
+        position = self._open_positions.get(self._current_bar.symbol)
+        return position.signed_qty if position else 0
+
+    @property
+    def cost_basis(self) -> ScaledPrice | None:
+        if self._current_bar is None:
+            return None
+        position = self._open_positions.get(self._current_bar.symbol)
+        return position.cost_basis if position else None
+
+    @property
+    def no_working_orders(self) -> bool:
+        if self._current_bar is None:
+            return True
+        symbol = self._current_bar.symbol
+        return not any(
+            order.symbol == symbol for order in self._working_orders.values()
+        )
 
     def submit_order(
         self,
@@ -670,6 +578,159 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
     def _on_cancel_order(self, event: Events.Strategy.CancelOrder) -> None: ...
 
 
+# ——————————————————————————————————————————————————————————————————————————————————————
+# CONCRETE IMPLEMENTATIONS
+# ——————————————————————————————————————————————————————————————————————————————————————
+
+
+class JSONLRecorder(RecorderBase):
+    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(
+        cls for cls in _EventBase.__subclasses__() if cls is not _SystemShutdown
+    )
+
+    def __init__(self, jsonl_path: Path = Path("./runs")) -> None:
+        self._run_id: str = f"{strftime('%Y%m%d_%H%M%S', gmtime())}_{uuid4().hex[:6]}"
+        self._path: Path = jsonl_path / f"{self._run_id}.jsonl"
+        self._jsonl_file: TextIOWrapper | None = None
+        super().__init__()  # attributes must exist before starting thread
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _event_loop(self) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._jsonl_file = open(self._path, "a")
+        try:
+            super()._event_loop()
+        finally:
+            if self._jsonl_file is not None:
+                self._jsonl_file.close()
+
+    def _on_event(self, event: _EventBase) -> None:
+        assert self._jsonl_file is not None
+        record = {
+            "run_id": self._run_id,
+            "event_type": type(event).__qualname__,
+            "data": asdict(event),
+        }
+        self._jsonl_file.write(json.dumps(record, default=str) + "\n")
+        self._jsonl_file.flush()
+
+
+class CSVDatafeedConnector(DatafeedConnectorBase):
+    def __init__(self, csv_path: Path) -> None:
+        self._csv_path = csv_path
+        self._symbols: frozenset[Symbol] = frozenset()
+        super().__init__()
+
+    def _subscribe(self, period_type: PeriodType, symbols: frozenset[Symbol]) -> None:
+        self._symbols |= symbols
+
+    def _connect(self) -> None:
+        with open(self._csv_path) as f:
+            column_names = next(csv.reader(f))
+            idx = {name: i for i, name in enumerate(column_names)}
+            i_sym, i_ts, i_rt = idx["symbol"], idx["ts_event"], idx["rtype"]
+            i_o, i_h, i_l, i_c, i_v = (
+                idx["open"],
+                idx["high"],
+                idx["low"],
+                idx["close"],
+                idx["volume"],
+            )
+            for row in csv.reader(f):
+                if row[i_sym] not in self._symbols:
+                    continue
+                self._wait_until_system_idle()
+                self.emit(
+                    Events.Datafeed.Bar(
+                        symbol=row[i_sym],
+                        period_start=int(row[i_ts]),
+                        period_type=PeriodType(int(row[i_rt])),
+                        open=int(row[i_o]),
+                        high=int(row[i_h]),
+                        low=int(row[i_l]),
+                        close=int(row[i_c]),
+                        volume=int(row[i_v]) if row[i_v] else None,
+                    )
+                )
+        self.emit(_SystemShutdown())  # initiate system shutdown at EOF
+
+    def _disconnect(self) -> None:
+        pass
+
+
+class Open(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Open"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.open
+
+
+class High(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "High"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.high
+
+
+class Low(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Low"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.low
+
+
+class Close(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Close"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return bar.close
+
+
+class Volume(_IndicatorBase):
+    @property
+    def name(self) -> str:
+        return "Volume"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        return float(bar.volume) if bar.volume is not None else float("nan")
+
+
+class SimpleMovingAverage(_IndicatorBase):
+    def __init__(self, window_length: int, source: _IndicatorBase) -> None:
+        super().__init__()
+        self._window_length: int = window_length
+        self._source_indicator: _IndicatorBase = self.add_indicator(source)
+
+    @property
+    def name(self) -> str:
+        return f"SMA_{self._window_length}_{self._source_indicator.name}"
+
+    def _compute(self, bar: Events.Datafeed.Bar) -> float:
+        source_indicator_history: deque[float] | None = (
+            self._source_indicator.get_history(bar.symbol)
+        )
+        if (
+            source_indicator_history is None
+            or len(source_indicator_history) < self._window_length
+        ):
+            return float("nan")
+        return (
+            sum(source_indicator_history[i] for i in range(-self._window_length, 0))
+            / self._window_length
+        )
+
+
 class SimulatedBrokerConnector(BrokerConnectorBase):
     SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
         Events.Strategy.SubmitOrder,
@@ -750,6 +811,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
             if order.symbol != bar.symbol:
                 continue
 
+            # TODO Get rid of indentation via private methods
             match order.order_type:
                 case OrderType.MARKET:
                     self._execute_order(order, bar.open, bar.period_start)
@@ -901,9 +963,216 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
         )
 
 
-if __name__ == "__main__":
-    recorder = JSONLRecorder()
-    datafeed = CSVDatafeedConnector(csv_path=Path(""))
+# ——————————————————————————————————————————————————————————————————————————————————————
+# WORKBENCH
+# ——————————————————————————————————————————————————————————————————————————————————————
 
-    dummy_strategy = ...
-    dummy_broker = ...
+
+if __name__ == "__main__":
+
+    class DummyStrategy(StrategyBase):
+        SYMBOLS: frozenset[Symbol] = frozenset(["MNQM9"])
+        PERIOD_TYPE: PeriodType = PeriodType.MINUTE
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.open: _IndicatorBase = self.add_indicator(Open())
+            self.sma = self.add_indicator(SimpleMovingAverage(20, Close()))
+
+        def on_bar(self, event: Events.Datafeed.Bar) -> None:
+            if (
+                self.open.latest(event.symbol) > self.sma.latest(event.symbol)
+                and self.position == 0
+                and self.no_working_orders
+            ):
+                self.submit_order(
+                    order_type=OrderType.MARKET, trade_side=TradeSide.BUY, qty=1
+                )
+            if (
+                self.open.latest(event.symbol) < self.sma.latest(event.symbol)
+                and self.position == 1
+                and self.no_working_orders
+            ):
+                self.submit_order(
+                    order_type=OrderType.MARKET, trade_side=TradeSide.SELL, qty=1
+                )
+
+    class Backtest:
+        # A fill within a round trip. May originate from a real broker fill,
+        # a BrokerConnected snapshot (starting into an existing position),
+        # or a split of a position-flipping fill (same fill closes one trade,
+        # opens the next). fill_id and order_id are only present for real fills.
+        @dataclass(frozen=True, kw_only=True)
+        class RoundTripFill:
+            # fmt: off
+            timestamp:              NanosecondsSinceUnixEpoch
+            symbol:                 Symbol
+            trade_side:             TradeSide
+            filled_qty:             Quantity
+            fill_price:             ScaledPrice
+            signed_position_size:   int
+            position_cost_basis:    ScaledPrice | None = None
+            fill_id:                UUID | None = None
+            order_id:               UUID | None = None
+            # fmt: on
+
+        # TODO integrate duration_bar, mfe, mae -> then update the method to parse
+        @dataclass(frozen=True, kw_only=True)
+        class RoundTrip:
+            fills: tuple["Backtest.RoundTripFill", ...]
+            mfe: ScaledPrice = 0
+            mae: ScaledPrice = 0
+            duration_bars: int = 0
+
+            @property
+            def symbol(self) -> Symbol:
+                return self.fills[0].symbol
+
+            @property
+            def direction(self) -> PositionDirection:
+                if self.fills[0].trade_side is TradeSide.BUY:
+                    return PositionDirection.LONG
+                return PositionDirection.SHORT
+
+        def __init__(
+            self, strategy_class: type[StrategyBase], csv_path: Path, jsonl_path: Path
+        ) -> None:
+            self.strategy_class = strategy_class
+            self.csv_path = csv_path
+            self.jsonl_path = jsonl_path
+            self._recorder: RecorderBase | None = None
+            self._round_trip_trades: defaultdict[Symbol, list["Backtest.RoundTrip"]] = (
+                defaultdict(list)
+            )
+
+        def run(self) -> None:
+            self._recorder = JSONLRecorder(jsonl_path=self.jsonl_path)
+            datafeed = CSVDatafeedConnector(csv_path=self.csv_path)
+            strategy = self.strategy_class()
+            broker = SimulatedBrokerConnector()
+
+            broker.wait_until_shutdown()
+            datafeed.wait_until_shutdown()
+            strategy.wait_until_shutdown()
+            self._recorder.wait_until_shutdown()
+
+            self._round_trip_trades = self._parse_round_trip_trades(self._recorder.path)
+
+        # TODO
+        def journey(self):
+            if self._recorder is None:
+                raise RuntimeError()
+            for symbol in self._round_trip_trades:
+                self._render_trade_journey(symbol)
+
+        # TODO
+        def charts(self):
+            pass
+
+        def _render_trade_journey(self, symbol: Symbol) -> None:
+            pass
+
+        @staticmethod
+        def _parse_round_trip_trades(
+            jsonl_path: Path,
+        ) -> defaultdict[Symbol, list[RoundTrip]]:
+            round_trip_trades: defaultdict[Symbol, list["Backtest.RoundTrip"]] = (
+                defaultdict(list)
+            )
+            open_trade: dict[Symbol, list["Backtest.RoundTripFill"]] = {}
+
+            def seed_open_positions(data: dict) -> None:
+                for sym, pos in data["open_positions"].items():
+                    open_trade[sym] = [
+                        Backtest.RoundTripFill(
+                            timestamp=data["timestamp"],
+                            symbol=sym,
+                            trade_side=(
+                                TradeSide.BUY
+                                if pos["signed_qty"] > 0
+                                else TradeSide.SELL
+                            ),
+                            filled_qty=abs(pos["signed_qty"]),
+                            fill_price=pos["cost_basis"],
+                            signed_position_size=pos["signed_qty"],
+                            position_cost_basis=pos["cost_basis"],
+                        )
+                    ]
+
+            def process_fill(data: dict) -> None:
+                fill = Backtest.RoundTripFill(
+                    timestamp=data["timestamp"],
+                    symbol=data["symbol"],
+                    trade_side=TradeSide[data["trade_side"].split(".")[-1]],
+                    filled_qty=data["filled_qty"],
+                    fill_price=data["fill_price"],
+                    signed_position_size=data["signed_position_size"],
+                    position_cost_basis=data["position_cost_basis"],
+                    fill_id=UUID(data["fill_id"]),
+                    order_id=UUID(data["order_id"]),
+                )
+
+                sym = fill.symbol
+                prev_pos = (
+                    open_trade[sym][-1].signed_position_size if sym in open_trade else 0
+                )
+
+                if prev_pos == 0 and fill.signed_position_size != 0:
+                    open_trade[sym] = [fill]
+                    return
+
+                if fill.signed_position_size == 0:
+                    open_trade[sym].append(fill)
+                    round_trip_trades[sym].append(
+                        Backtest.RoundTrip(fills=tuple(open_trade.pop(sym)))
+                    )
+                    return
+
+                if prev_pos * fill.signed_position_size < 0:
+                    open_trade[sym].append(
+                        Backtest.RoundTripFill(
+                            timestamp=fill.timestamp,
+                            symbol=sym,
+                            trade_side=fill.trade_side,
+                            filled_qty=abs(prev_pos),
+                            fill_price=fill.fill_price,
+                            signed_position_size=0,
+                            position_cost_basis=None,
+                        )
+                    )
+                    round_trip_trades[sym].append(
+                        Backtest.RoundTrip(fills=tuple(open_trade[sym]))
+                    )
+                    open_trade[sym] = [
+                        Backtest.RoundTripFill(
+                            timestamp=fill.timestamp,
+                            symbol=sym,
+                            trade_side=fill.trade_side,
+                            filled_qty=abs(fill.signed_position_size),
+                            fill_price=fill.fill_price,
+                            signed_position_size=fill.signed_position_size,
+                            position_cost_basis=fill.position_cost_basis,
+                        )
+                    ]
+                    return
+
+                open_trade[sym].append(fill)
+
+            with open(jsonl_path) as f:
+                for line in f:
+                    record = json.loads(line)
+                    event_type = record["event_type"]
+
+                    if "BrokerConnected" in event_type:
+                        seed_open_positions(record["data"])
+                    elif "Fill" in event_type:
+                        process_fill(record["data"])
+
+            return round_trip_trades
+
+    backtest = Backtest(
+        strategy_class=DummyStrategy,
+        jsonl_path=Path("./runs"),
+        csv_path=Path("./mnq_minute.csv"),
+    )
+    backtest.run()
