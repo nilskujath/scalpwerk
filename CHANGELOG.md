@@ -2,6 +2,57 @@
 
 <!-- version list -->
 
+## v2.0.0 (2026-05-26)
+
+### Bug Fixes
+
+- Updated greenfield reimplementation
+  ([`33e36f2`](https://github.com/nilskujath/scalpwerk/commit/33e36f2112b06ad9b8e60fb88c0ec36fb588220e))
+
+- Updated greenfield reimplementation
+  ([`62aeb24`](https://github.com/nilskujath/scalpwerk/commit/62aeb24cda844b26182ad04a4704bde51e9d276b))
+
+### Features
+
+- Add ATR-adaptive non-repainting swing detector
+  ([`9f9b2cf`](https://github.com/nilskujath/scalpwerk/commit/9f9b2cfd14ae29c128946167b0eb285e1acd2f9c))
+
+- Add Bollinger Band turnaround detector
+  ([`1e86ebf`](https://github.com/nilskujath/scalpwerk/commit/1e86ebf70583c1804840968d0e70b3d8f0cb9a4b))
+
+- Add Bollinger Bands, BoostedRSI, and Reverse RSI indicators
+  ([`2a0c417`](https://github.com/nilskujath/scalpwerk/commit/2a0c41731cb8ffb31ea134d68f48ca1bea3dbd61))
+
+- Add RSI indicator and fix NaN handling in recorder
+  ([`08d4b9d`](https://github.com/nilskujath/scalpwerk/commit/08d4b9d5299c17d820ef92f559688e59f7b78318))
+
+- Add SMA and ATR indicators, BarField enum, START/STOP datafeed filtering
+  ([`ed7469c`](https://github.com/nilskujath/scalpwerk/commit/ed7469c2c3f5b0d055faef107adb309a4a0fe8b1))
+
+- Added CSVDatafeedConnector and SMA indicator
+  ([`5ec3dc2`](https://github.com/nilskujath/scalpwerk/commit/5ec3dc240c05cce8e295b970ca9f0ac071e46c87))
+
+- Added JSONLRecorder
+  ([`04faada`](https://github.com/nilskujath/scalpwerk/commit/04faada239a09e39afa60529be1125b713eeb238))
+
+- Complete rework of core
+  ([`3519fad`](https://github.com/nilskujath/scalpwerk/commit/3519fad0330d9def0241ca89bf816830ea7f14da))
+
+- Completed simulated broker
+  ([`eef8695`](https://github.com/nilskujath/scalpwerk/commit/eef8695b6e214de7ee25c10335d9def2f66c98b8))
+
+- Implement SimulatedBroker with order matching, commissions, and position tracking
+  ([`cc8746b`](https://github.com/nilskujath/scalpwerk/commit/cc8746bedfb31d4758083d217bae093440c52b97))
+
+- Update, started Backtester class
+  ([`d6839a5`](https://github.com/nilskujath/scalpwerk/commit/d6839a5dff23aeac077a1009750888d12db26eb5))
+
+### Refactoring
+
+- Strated greenfield reimplementation
+  ([`516434f`](https://github.com/nilskujath/scalpwerk/commit/516434fde39d6ad09742029b4b6abf39ea998413))
+
+
 ## v1.8.0 (2026-05-07)
 
 ### Features
