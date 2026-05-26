@@ -316,7 +316,7 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
 
 
 class _IndicatorBase(ABC):
-    IS_OUTPUT_SCALED: bool = False
+    IS_OUTPUT_SCALED: bool = True
 
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
