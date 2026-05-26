@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.1.0 (2026-05-26)
+
+### Features
+
+- Added indicators module
+  ([`bf32f46`](https://github.com/nilskujath/scalpwerk/commit/bf32f4626142925994ff386c0aae8f77df62e310))
+
+
 ## v2.0.0 (2026-05-26)
 
 ### Bug Fixes
