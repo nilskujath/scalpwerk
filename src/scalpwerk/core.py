@@ -81,19 +81,19 @@ class OpenPosition:
 
 
 @dataclass(frozen=True, kw_only=True)
-class _EventBase:
+class EventBase:
     timestamp: NanosecondsSinceUnixEpoch = field(default_factory=lambda: time_ns())
 
 
 class Events:
     class System:
         @dataclass(frozen=True, kw_only=True)
-        class Shutdown(_EventBase):
+        class Shutdown(EventBase):
             pass
 
     class Datafeed:
         @dataclass(frozen=True, kw_only=True)
-        class Bar(_EventBase):
+        class Bar(EventBase):
             # fmt: off
             symbol:         Symbol
             period_start:   NanosecondsSinceUnixEpoch
@@ -107,14 +107,14 @@ class Events:
 
     class Strategy:
         @dataclass(frozen=True, kw_only=True)
-        class StreamRequest(_EventBase):
+        class StreamRequest(EventBase):
             # fmt: off
             period_type:    PeriodType
             symbols:        frozenset[Symbol]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class IndicatorUpdate(_EventBase):
+        class IndicatorUpdate(EventBase):
             # fmt: off
             symbol:         Symbol
             source_event:   "Events.Datafeed.Bar"
@@ -122,7 +122,7 @@ class Events:
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class SubmitOrder(_EventBase):
+        class SubmitOrder(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
@@ -137,7 +137,7 @@ class Events:
         # We do not modify orders, cancel and resubmit is the way. This significantly
         # reduces the surface area of our system and reduces complexity.
         @dataclass(frozen=True, kw_only=True)
-        class CancelOrder(_EventBase):
+        class CancelOrder(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
@@ -145,36 +145,21 @@ class Events:
 
     class Broker:
         @dataclass(frozen=True, kw_only=True)
-        class BrokerConnected(_EventBase):
+        class BrokerConnected(EventBase):
             # fmt: off
             working_orders: dict[UUID, WorkingOrder]
             open_positions: dict[Symbol, OpenPosition]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class OrderAccepted(_EventBase):
+        class OrderAccepted(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class OrderRejected(_EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       UUID
-            reason:         str
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class CancellationAccepted(_EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       UUID
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class CancellationRejected(_EventBase):
+        class OrderRejected(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
@@ -182,7 +167,22 @@ class Events:
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class Fill(_EventBase):
+        class CancellationAccepted(EventBase):
+            # fmt: off
+            symbol:         Symbol
+            order_id:       UUID
+            # fmt: on
+
+        @dataclass(frozen=True, kw_only=True)
+        class CancellationRejected(EventBase):
+            # fmt: off
+            symbol:         Symbol
+            order_id:       UUID
+            reason:         str
+            # fmt: on
+
+        @dataclass(frozen=True, kw_only=True)
+        class Fill(EventBase):
             # fmt: off
             symbol:         Symbol
             fill_id:        UUID
@@ -197,7 +197,7 @@ class Events:
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
-        class OrderExpired(_EventBase):
+        class OrderExpired(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
@@ -205,21 +205,21 @@ class Events:
 
 
 class _ComponentLike(Protocol):  # protocol to avoid circular dependencies
-    def receive(self, event: _EventBase) -> None: ...
+    def receive(self, event: EventBase) -> None: ...
     @property
     def is_idle(self) -> bool: ...
     def wait_until_idle(self) -> None: ...
 
 
-class _EventBus:
+class EventBus:
     def __init__(self) -> None:
-        self._subs: dict[type[_EventBase], set[_ComponentLike]] = defaultdict(set)
+        self._subs: dict[type[EventBase], set[_ComponentLike]] = defaultdict(set)
 
-    def subscribe(self, component: _ComponentLike, *event_types: type[_EventBase]):
+    def subscribe(self, component: _ComponentLike, *event_types: type[EventBase]):
         for event_type in event_types:
             self._subs[event_type].add(component)
 
-    def publish(self, event: _EventBase):
+    def publish(self, event: EventBase):
         for component in self._subs[type(event)]:
             component.receive(event)
 
@@ -234,7 +234,7 @@ class _EventBus:
                 break
 
 
-_system_event_bus = _EventBus()  # global so standard use case is simplified
+_system_event_bus = EventBus()  # global so standard use case is simplified
 
 
 class _Connectable(ABC):
@@ -246,19 +246,19 @@ class _Connectable(ABC):
 
 
 class _ComponentBase(_ComponentLike, ABC):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = ()
+    SUBSCRIBE_TO: tuple[type[EventBase], ...] = ()
 
-    def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
-        self._event_bus: _EventBus = event_bus
+    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
+        self._event_bus: EventBus = event_bus
         self._event_bus.subscribe(self, *self.SUBSCRIBE_TO, Events.System.Shutdown)
-        self._queue: Queue[_EventBase] = Queue()
+        self._queue: Queue[EventBase] = Queue()
         self._thread: Thread = Thread(target=self._event_loop, name=type(self).__name__)
         self._thread.start()
 
-    def receive(self, event: _EventBase) -> None:
+    def receive(self, event: EventBase) -> None:
         self._queue.put(event)
 
-    def emit(self, event: _EventBase) -> None:
+    def emit(self, event: EventBase) -> None:
         self._event_bus.publish(event)
 
     def _event_loop(self) -> None:
@@ -274,7 +274,7 @@ class _ComponentBase(_ComponentLike, ABC):
             self._disconnect()
 
     @abstractmethod
-    def _on_event(self, event: _EventBase) -> None: ...
+    def _on_event(self, event: EventBase) -> None: ...
 
     # System pacing utilities
 
@@ -293,11 +293,11 @@ class _ComponentBase(_ComponentLike, ABC):
 
 
 class RecorderBase(_ComponentBase, ABC):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = tuple(_EventBase.__subclasses__())
+    SUBSCRIBE_TO: tuple[type[EventBase], ...] = tuple(EventBase.__subclasses__())
 
 
 class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
+    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
         Events.Strategy.StreamRequest,
         Events.Broker.BrokerConnected,
     )
@@ -307,7 +307,7 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
         self, period_type: PeriodType, symbols: frozenset[Symbol]
     ) -> None: ...
 
-    def _on_event(self, event: _EventBase) -> None:
+    def _on_event(self, event: EventBase) -> None:
         match event:
             case Events.Strategy.StreamRequest() as event:
                 self._subscribe(period_type=event.period_type, symbols=event.symbols)
@@ -355,7 +355,7 @@ class _IndicatorBase(ABC):
 
 
 class StrategyBase(_ComponentBase):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
+    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
         Events.Datafeed.Bar,
         Events.Broker.BrokerConnected,
         Events.Broker.OrderAccepted,
@@ -369,7 +369,7 @@ class StrategyBase(_ComponentBase):
     SYMBOLS: frozenset[Symbol] = frozenset()
     PERIOD_TYPE: PeriodType = PeriodType.SECOND
 
-    def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
+    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
 
         self._indicators: dict[str, _IndicatorBase] = {}
@@ -454,7 +454,7 @@ class StrategyBase(_ComponentBase):
         self._submitted_cancellations[working_order.order_id] = order_cancellation_event
         self.emit(order_cancellation_event)
 
-    def _on_event(self, event: _EventBase) -> None:
+    def _on_event(self, event: EventBase) -> None:
         # fmt: off
         match event:
             case Events.Datafeed.Bar()                  as event:
@@ -541,12 +541,12 @@ class StrategyBase(_ComponentBase):
 
 
 class BrokerConnectorBase(_ComponentBase, _Connectable):
-    SUBSCRIBE_TO: tuple[type[_EventBase], ...] = (
+    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
         Events.Strategy.SubmitOrder,
         Events.Strategy.CancelOrder,
     )
 
-    def __init__(self, event_bus: _EventBus = _system_event_bus) -> None:
+    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
         self._connect()
         working_orders, open_positions = self._exposure_snapshot()
@@ -558,11 +558,12 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
         )
 
     @abstractmethod
+    # Reflects that we don't know fills if we have an existing position at broker
     def _exposure_snapshot(
         self,
     ) -> tuple[dict[UUID, WorkingOrder], dict[Symbol, OpenPosition]]: ...
 
-    def _on_event(self, event: _EventBase) -> None:
+    def _on_event(self, event: EventBase) -> None:
         match event:
             case Events.Strategy.SubmitOrder() as event:
                 self._on_submit_order(event)
