@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.6.0 (2026-05-27)
+
+### Features
+
+- Replaced JSONLRecorder with PickleRecorder
+  ([`a76ac30`](https://github.com/nilskujath/scalpwerk/commit/a76ac30005c56dae54d6e94a9fe0b29971234f56))
+
+
 ## v2.5.0 (2026-05-27)
 
 ### Features
