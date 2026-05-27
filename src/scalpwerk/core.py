@@ -5,7 +5,7 @@ from enum import Enum, auto
 from queue import Queue
 from threading import Thread
 from time import time_ns
-from typing import Protocol
+from typing import Protocol, NamedTuple
 from uuid import UUID, uuid4
 
 PRICE_SCALE_FACTOR = 1_000_000_000  # compatible with Databento's conventions
@@ -15,6 +15,9 @@ type ScaledPrice = int  # actual price multiplied by `PRICE_SCALE_FACTOR`
 type Symbol = str
 type Quantity = int
 type SignedQuantity = int  # positive if long, negative if short
+type IndicatorName = str
+type PlotGroup = int | None  # 0 = on price, -n above, +n below, `None` = don't plot
+type Reason = str
 
 
 class PeriodType(Enum):  # values for easy compatibility with Databento's conventions
@@ -75,8 +78,16 @@ class WorkingOrder:
 class OpenPosition:
     # fmt: off
     symbol:         Symbol
-    signed_qty:     Quantity
+    signed_qty:     SignedQuantity
     cost_basis:     ScaledPrice
+    # fmt: on
+
+
+class IndicatorReading(NamedTuple):
+    # fmt: off
+    value:      float
+    is_scaled:  bool
+    plot_group: PlotGroup
     # fmt: on
 
 
@@ -118,7 +129,7 @@ class Events:
             # fmt: off
             symbol:         Symbol
             source_event:   "Events.Datafeed.Bar"
-            ind_values:     dict[str, tuple[float, bool]]  # tuple: (value, is_scaled)
+            ind_values:     dict[IndicatorName, IndicatorReading]
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -163,7 +174,7 @@ class Events:
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
-            reason:         str
+            reason:         Reason
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -178,7 +189,7 @@ class Events:
             # fmt: off
             symbol:         Symbol
             order_id:       UUID
-            reason:         str
+            reason:         Reason
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -192,7 +203,7 @@ class Events:
             fill_price:     ScaledPrice
 
             # position state after this fill; broker is single source of truth
-            signed_position_size:   int
+            signed_position_size:   SignedQuantity
             position_cost_basis:    ScaledPrice | None = None  # None when flat
             # fmt: on
 
@@ -320,12 +331,14 @@ class _IndicatorBase(ABC):
 
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
-        self._history: dict[str, deque[float]] = {}
-        self._input_indicators: dict[str, "_IndicatorBase"] = {}
+        self._history: dict[Symbol, deque[float]] = {}
+        self._input_indicators: dict[IndicatorName, "_IndicatorBase"] = {}
 
     @property
     @abstractmethod
-    def name(self) -> str: ...  # use f-string to put parameters in indicator name
+    def name(
+        self,
+    ) -> IndicatorName: ...  # use f-string to put parameter values in indicator name
 
     @abstractmethod
     def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
@@ -372,11 +385,12 @@ class StrategyBase(_ComponentBase):
     def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
 
-        self._indicators: dict[str, _IndicatorBase] = {}
+        self._indicators: dict[IndicatorName, _IndicatorBase] = {}
+        self._indicator_plot_groups: dict[IndicatorName, PlotGroup] = {}
         self._current_bar: Events.Datafeed.Bar | None = None
 
         self._working_orders: dict[UUID, WorkingOrder] = {}
-        self._open_positions: dict[str, OpenPosition] = {}
+        self._open_positions: dict[Symbol, OpenPosition] = {}
 
         # In-flight requests awaiting broker acknowledgement.
         self._submitted_orders: dict[UUID, Events.Strategy.SubmitOrder] = {}
@@ -388,8 +402,14 @@ class StrategyBase(_ComponentBase):
             )
         )
 
-    def add_indicator(self, indicator: _IndicatorBase) -> _IndicatorBase:
+    def add_indicator(
+        self,
+        indicator: _IndicatorBase,
+        *,  # kw-only forces self-documentation at strategy definition
+        plot_group: PlotGroup = 0,
+    ) -> _IndicatorBase:
         self._indicators[indicator.name] = indicator
+        self._indicator_plot_groups[indicator.name] = plot_group
         return indicator  # for inline assignment: `self.sma = self.add_indicator(...)`
 
     @abstractmethod
@@ -497,7 +517,11 @@ class StrategyBase(_ComponentBase):
                 symbol=event.symbol,
                 source_event=event,
                 ind_values={
-                    name: (indicator.latest(event.symbol), indicator.IS_OUTPUT_SCALED)
+                    name: IndicatorReading(
+                        value=indicator.latest(event.symbol),
+                        is_scaled=indicator.IS_OUTPUT_SCALED,
+                        plot_group=self._indicator_plot_groups[name],
+                    )
                     for name, indicator in self._indicators.items()
                 },
             )
@@ -557,8 +581,8 @@ class BrokerConnectorBase(_ComponentBase, _Connectable):
             )
         )
 
-    @abstractmethod
     # Reflects that we don't know fills if we have an existing position at broker
+    @abstractmethod
     def _exposure_snapshot(
         self,
     ) -> tuple[dict[UUID, WorkingOrder], dict[Symbol, OpenPosition]]: ...
