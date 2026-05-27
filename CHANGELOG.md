@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.5.0 (2026-05-27)
+
+### Features
+
+- Added PicklRecorder to recorders module
+  ([`a122a40`](https://github.com/nilskujath/scalpwerk/commit/a122a40d0681d03f62cba18a70a3c58f9ec56d01))
+
+
 ## v2.4.0 (2026-05-27)
 
 ### Features
