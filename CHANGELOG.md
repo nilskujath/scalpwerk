@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.4.0 (2026-05-27)
+
+### Features
+
+- Added recorders module
+  ([`65bc937`](https://github.com/nilskujath/scalpwerk/commit/65bc93749f26198863989f32b172fcee12d5d104))
+
+
 ## v2.3.0 (2026-05-27)
 
 ### Features
