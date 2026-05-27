@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.2.0 (2026-05-27)
+
+### Features
+
+- Added datafeeds module
+  ([`2671fc2`](https://github.com/nilskujath/scalpwerk/commit/2671fc286d34f747cb81f6ae69b543f5e23df303))
+
+
 ## v2.1.0 (2026-05-26)
 
 ### Features
