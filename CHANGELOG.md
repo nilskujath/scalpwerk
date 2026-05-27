@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.3.0 (2026-05-27)
+
+### Features
+
+- Added brokers module
+  ([`9c6707e`](https://github.com/nilskujath/scalpwerk/commit/9c6707ee6e6002a7bedf518e5649596b3e07b312))
+
+
 ## v2.2.0 (2026-05-27)
 
 ### Features
