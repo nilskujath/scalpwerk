@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.7.0 (2026-05-27)
+
+### Features
+
+- Added indicator plot grouping and type aliases
+  ([`e65a101`](https://github.com/nilskujath/scalpwerk/commit/e65a101cd03215aeeee39737b06ed490cd30c633))
+
+
 ## v2.6.0 (2026-05-27)
 
 ### Features
