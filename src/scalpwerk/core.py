@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 PRICE_SCALE_FACTOR = 1_000_000_000  # compatible with Databento's conventions
 
 type NanosecondsSinceUnixEpoch = int
+type Nanoseconds = int
 type ScaledPrice = int  # actual price multiplied by `PRICE_SCALE_FACTOR`
 type Symbol = str
 type Quantity = int
@@ -27,6 +28,18 @@ class PeriodType(Enum):  # values for easy compatibility with Databento's conven
     HOUR    = 34
     DAY     = 35
     # fmt: on
+
+    @property
+    def duration_in_nanoseconds(self) -> Nanoseconds:
+        match self:
+            case PeriodType.SECOND:
+                return 1_000_000_000
+            case PeriodType.MINUTE:
+                return 60_000_000_000
+            case PeriodType.HOUR:
+                return 3_600_000_000_000
+            case PeriodType.DAY:
+                return 86_400_000_000_000
 
 
 class OrderType(Enum):

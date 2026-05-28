@@ -59,7 +59,7 @@ class SimpleMovingAverage(_IndicatorBase):
 
     @property
     def name(self) -> str:
-        return f"SMA_{self._window_len}_{self._source_ind.name}"
+        return f"SMA ({self._window_len}, {self._source_ind.name})"
 
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
         src_hist: deque[float] | None = self._source_ind.get_history(bar.symbol)
