@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v2.8.0 (2026-05-28)
+
+### Bug Fixes
+
+- Ignore matplotlib missing imports in mypy config
+  ([`cb4c5c3`](https://github.com/nilskujath/scalpwerk/commit/cb4c5c313688e2182d48792d1e08deee21eebe33))
+
+### Features
+
+- Added charting module with candlestick and indicator rendering
+  ([`705f058`](https://github.com/nilskujath/scalpwerk/commit/705f058664037af655a9053181a6e410ddd06536))
+
+
 ## v2.7.0 (2026-05-27)
 
 ### Features
