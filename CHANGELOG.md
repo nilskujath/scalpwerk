@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.9.0 (2026-05-29)
+
+### Features
+
+- Extended charting with fills, position tracking, and bar styles
+  ([`b98c0e1`](https://github.com/nilskujath/scalpwerk/commit/b98c0e1fb85d6b4737c86d628cbe642c7466f182))
+
+
 ## v2.8.0 (2026-05-28)
 
 ### Bug Fixes
