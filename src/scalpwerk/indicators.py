@@ -52,10 +52,11 @@ class Volume(_IndicatorBase):
 
 class SimpleMovingAverage(_IndicatorBase):
     def __init__(self, window_length: int, source: _IndicatorBase) -> None:
-        super().__init__()
+        super().__init__(max_history=window_length)
         self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
-        self._window_len: int = window_length
-        self._source_ind: _IndicatorBase = self.add_indicator(source)
+        self._window_len = window_length
+        source._max_history = max(source._max_history, window_length)
+        self._source_ind = self.add_indicator(source)
 
     @property
     def name(self) -> str:

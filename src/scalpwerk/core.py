@@ -41,6 +41,10 @@ class PeriodType(Enum):  # values for easy compatibility with Databento's conven
             case PeriodType.DAY:
                 return 86_400_000_000_000
 
+    @property
+    def duration_in_days(self) -> float:  # useful for plotting with mpl's date system
+        return self.duration_in_nanoseconds / 86_400_000_000_000
+
 
 class OrderType(Enum):
     # fmt: off
