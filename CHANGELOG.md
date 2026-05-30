@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v2.10.0 (2026-05-30)
+
+### Bug Fixes
+
+- Raise on duplicate indicator names in add_indicator
+  ([`ec592d0`](https://github.com/nilskujath/scalpwerk/commit/ec592d0c87dc21c188a29a8840969ffc32ec94fb))
+
+### Features
+
+- Added indicators, fixed some bugs
+  ([`53db744`](https://github.com/nilskujath/scalpwerk/commit/53db7442abcb8fbfd412e7bfcf65e12ec3fd531e))
+
+
 ## v2.9.0 (2026-05-29)
 
 ### Features
