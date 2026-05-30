@@ -116,7 +116,8 @@ def _format_figure(
         fontsize=10,
     )
 
-    fig.tight_layout()
+    title_space_inches = 0.2
+    fig.tight_layout(rect=(0, 0, 1, 1 - title_space_inches / fig.get_figheight()))
 
 
 def _nanoseconds_to_mpldate(ns_since_epoch: NanosecondsSinceUnixEpoch) -> MplDate:

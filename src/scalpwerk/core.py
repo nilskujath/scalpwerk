@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from queue import Queue
@@ -343,13 +344,13 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
                 self._connect()  # connect datafeed only after broker is connected (!)
 
 
-class _IndicatorBase(ABC):
+class IndicatorBase(ABC):
     IS_OUTPUT_SCALED: bool = True
 
     def __init__(self, max_history: int = 100) -> None:
         self._max_history = max(1, int(max_history))
         self._history: dict[Symbol, deque[float]] = {}
-        self._input_indicators: dict[IndicatorName, "_IndicatorBase"] = {}
+        self._input_indicators: dict[IndicatorName, "IndicatorBase"] = {}
 
     @property
     @abstractmethod
@@ -360,7 +361,8 @@ class _IndicatorBase(ABC):
     @abstractmethod
     def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
 
-    def add_indicator(self, indicator: "_IndicatorBase") -> "_IndicatorBase":
+    def add_indicator(self, indicator: "IndicatorBase") -> "IndicatorBase":
+        indicator = deepcopy(indicator)  # isolate from shared references
         if indicator.name in self._input_indicators:
             raise ValueError(f"duplicate input indicator {indicator.name!r}")
         self._input_indicators[indicator.name] = indicator
@@ -404,7 +406,7 @@ class StrategyBase(_ComponentBase):
     def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
 
-        self._indicators: dict[IndicatorName, _IndicatorBase] = {}
+        self._indicators: dict[IndicatorName, IndicatorBase] = {}
         self._indicator_plot_groups: dict[IndicatorName, PlotGroup] = {}
         self._current_bar: Events.Datafeed.Bar | None = None
 
@@ -423,11 +425,13 @@ class StrategyBase(_ComponentBase):
 
     def add_indicator(
         self,
-        indicator: _IndicatorBase,
-        *,  # kw-only forces self-documentation at strategy definition
+        indicator: IndicatorBase,
+        *,
         plot_group: PlotGroup = 0,
-    ) -> _IndicatorBase:
+    ) -> IndicatorBase:
+        indicator = deepcopy(indicator)  # isolate from shared references
         if indicator.name in self._indicators:
+            self.emit(Events.System.Shutdown())
             raise ValueError(f"duplicate indicator {indicator.name!r}")
         self._indicators[indicator.name] = indicator
         self._indicator_plot_groups[indicator.name] = plot_group
