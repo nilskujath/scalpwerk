@@ -361,6 +361,8 @@ class _IndicatorBase(ABC):
     def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
 
     def add_indicator(self, indicator: "_IndicatorBase") -> "_IndicatorBase":
+        if indicator.name in self._input_indicators:
+            raise ValueError(f"duplicate input indicator {indicator.name!r}")
         self._input_indicators[indicator.name] = indicator
         return indicator
 
@@ -425,6 +427,8 @@ class StrategyBase(_ComponentBase):
         *,  # kw-only forces self-documentation at strategy definition
         plot_group: PlotGroup = 0,
     ) -> _IndicatorBase:
+        if indicator.name in self._indicators:
+            raise ValueError(f"duplicate indicator {indicator.name!r}")
         self._indicators[indicator.name] = indicator
         self._indicator_plot_groups[indicator.name] = plot_group
         return indicator  # for inline assignment: `self.sma = self.add_indicator(...)`
