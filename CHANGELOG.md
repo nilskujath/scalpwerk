@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.11.0 (2026-06-08)
+
+### Features
+
+- Split up StrategyBase
+  ([`eceb9c7`](https://github.com/nilskujath/scalpwerk/commit/eceb9c753148888e5df741e557cfc56c6dbeec52))
+
+
 ## v2.10.0 (2026-05-30)
 
 ### Bug Fixes
