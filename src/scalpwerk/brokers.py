@@ -1,10 +1,10 @@
 from collections import deque
 from dataclasses import replace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 
 from .core import (
-    NanosecondsSinceUnixEpoch,
+    NsSinceUnixEpoch,
     ScaledPrice,
     Symbol,
     Quantity,
@@ -12,7 +12,9 @@ from .core import (
     OrderType,
     TradeSide,
     WorkingOrder,
+    WorkingOrders,
     OpenPosition,
+    OpenPositions,
     EventBase,
     Events,
     BrokerConnectorBase,
@@ -32,7 +34,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
     # fmt: on
 
     def __init__(self) -> None:
-        self._working_orders: dict[UUID, WorkingOrder] = {}  # incl. market orders
+        self._working_orders: WorkingOrders = {}  # incl. market orders
         self._open_entries: dict[Symbol, deque[tuple[SignedQuantity, ScaledPrice]]] = {}
         super().__init__()
 
@@ -42,9 +44,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
     def _disconnect(self) -> None:  # called at component shutdown from `_event_loop`
         pass
 
-    def _exposure_snapshot(
-        self,
-    ) -> tuple[dict[UUID, WorkingOrder], dict[Symbol, OpenPosition]]:
+    def _exposure_snapshot(self) -> tuple[WorkingOrders, OpenPositions]:
         return self._working_orders.copy(), {
             symbol: OpenPosition(
                 symbol=symbol,
@@ -175,7 +175,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
         self,
         order: WorkingOrder,
         fill_price: ScaledPrice,
-        fill_timestamp: NanosecondsSinceUnixEpoch,
+        fill_timestamp: NsSinceUnixEpoch,
     ) -> None:
         del self._working_orders[order.order_id]
 

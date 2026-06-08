@@ -1,7 +1,7 @@
 from collections import deque
 from enum import Enum, auto
 
-from src.scalpwerk.core import IndicatorBase, Events, IndicatorName, Symbol
+from .core import IndicatorBase, Events, IndicatorName, Symbol
 
 
 class ClampSide(Enum):
@@ -51,7 +51,7 @@ class Close(IndicatorBase):
 
 
 class Volume(IndicatorBase):
-    IS_OUTPUT_SCALED = False
+    IS_SCALED = False
 
     @property
     def name(self) -> IndicatorName:
@@ -64,7 +64,7 @@ class Volume(IndicatorBase):
 class SMA(IndicatorBase):
     def __init__(self, period: int, source: IndicatorBase) -> None:
         super().__init__()
-        self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
+        self.IS_SCALED = source.IS_SCALED
         if period < 1:
             raise ValueError("period must be positive")
         self._period = period
@@ -89,7 +89,7 @@ class EMA(IndicatorBase):
         self, period: int, source: IndicatorBase, *, alpha: float | None = None
     ) -> None:
         super().__init__()
-        self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
+        self.IS_SCALED = source.IS_SCALED
         if period < 1:
             raise ValueError("period must be positive")
         self._period = period
@@ -132,7 +132,7 @@ class SMADetrendOscillator(IndicatorBase):
         self._slow_period = slow_period
         if sma_source is None:
             sma_source = Close()
-        self.IS_OUTPUT_SCALED = sma_source.IS_OUTPUT_SCALED
+        self.IS_SCALED = sma_source.IS_SCALED
         self._fast_sma = self.add_indicator(SMA(fast_period, sma_source))
         self._slow_sma = self.add_indicator(SMA(slow_period, sma_source))
 
@@ -151,7 +151,7 @@ class SMADetrendOscillator(IndicatorBase):
 class Momentum(IndicatorBase):
     def __init__(self, period: int, source: IndicatorBase) -> None:
         super().__init__()
-        self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
+        self.IS_SCALED = source.IS_SCALED
         if period < 1:
             raise ValueError("period must be positive")
         self._period = period
@@ -177,7 +177,7 @@ class Momentum(IndicatorBase):
 class Clamp(IndicatorBase):
     def __init__(self, source: IndicatorBase, *, clamp_side: ClampSide) -> None:
         super().__init__()
-        self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
+        self.IS_SCALED = source.IS_SCALED
         self._clamp_side = clamp_side
         self._source = self.add_indicator(source)
 
@@ -195,7 +195,7 @@ class Clamp(IndicatorBase):
 
 
 class RSI(IndicatorBase):
-    IS_OUTPUT_SCALED = False
+    IS_SCALED = False
 
     def __init__(
         self,
@@ -258,7 +258,7 @@ class BollingerBand(IndicatorBase):
             raise ValueError("period must be positive")
         if source is None:
             source = Close()
-        self.IS_OUTPUT_SCALED = source.IS_OUTPUT_SCALED
+        self.IS_SCALED = source.IS_SCALED
         self._period = period
         self._side = side
         self._num_std = float(num_std)
@@ -283,7 +283,7 @@ class BollingerBand(IndicatorBase):
 
 
 class BollingerBandwidth(IndicatorBase):
-    IS_OUTPUT_SCALED = False
+    IS_SCALED = False
 
     def __init__(
         self,

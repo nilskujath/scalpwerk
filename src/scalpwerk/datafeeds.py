@@ -7,6 +7,13 @@ from .core import DatafeedConnectorBase, Symbol, PeriodType, Events
 
 
 class CSVDatafeedConnector(DatafeedConnectorBase):
+    _DATABENTO_RTYPE_TO_PERIOD: dict[int, PeriodType] = {
+        32: PeriodType.SECOND,
+        33: PeriodType.MINUTE,
+        34: PeriodType.HOUR,
+        35: PeriodType.DAY,
+    }
+
     def __init__(self, csv_path: Path) -> None:
         self._csv_path = csv_path
         self._subscriptions: frozenset[tuple[Symbol, PeriodType]] = frozenset()
@@ -17,33 +24,31 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
 
     def _connect(self) -> None:
         for bar in self._iter_bars():
-            self._wait_until_system_idle()  # ensure previous bar is fully processed
+            self._wait_until_system_idle()
             self.emit(bar)
-        self.emit(Events.System.Shutdown())  # historical data is exhausted, stop system
+        self.emit(Events.System.Shutdown())
 
     def _iter_bars(self) -> Iterator[Events.Datafeed.Bar]:
         with open(self._csv_path) as f:
             header = next(csv.reader(f))
-            column_index = {name: position for position, name in enumerate(header)}
+            col = {name: pos for pos, name in enumerate(header)}
 
             for row in csv.reader(f):
-                sym = row[column_index["symbol"]]
-                period = PeriodType(int(row[column_index["rtype"]]))
+                sym = row[col["symbol"]]
+                period = self._DATABENTO_RTYPE_TO_PERIOD.get(int(row[col["rtype"]]))
+                if period is None:
+                    continue
                 if (sym, period) not in self._subscriptions:
                     continue
                 yield Events.Datafeed.Bar(
                     symbol=sym,
-                    period_start=int(row[column_index["ts_event"]]),
+                    period_start=int(row[col["ts_event"]]),
                     period_type=period,
-                    open=int(row[column_index["open"]]),
-                    high=int(row[column_index["high"]]),
-                    low=int(row[column_index["low"]]),
-                    close=int(row[column_index["close"]]),
-                    volume=(
-                        int(row[column_index["volume"]])
-                        if row[column_index["volume"]]
-                        else None
-                    ),
+                    open=int(row[col["open"]]),
+                    high=int(row[col["high"]]),
+                    low=int(row[col["low"]]),
+                    close=int(row[col["close"]]),
+                    volume=(int(row[col["volume"]]) if row[col["volume"]] else None),
                 )
 
     def _disconnect(self) -> None:

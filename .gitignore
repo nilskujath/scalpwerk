@@ -12,4 +12,4 @@ build/
 tests/
 ignore/
 runs/
-run.py
+ignore/run.py

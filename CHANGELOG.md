@@ -170,7 +170,7 @@
 - Restructure domain model
   ([`314293f`](https://github.com/nilskujath/scalpwerk/commit/314293f4e01aaef4ecfc6bf997dd2610a3ec6c18))
 
-- Simplify broker events, add TimeInForce, use cost basis
+- Simplify broker events, register TimeInForce, use cost basis
   ([`f785e5f`](https://github.com/nilskujath/scalpwerk/commit/f785e5f4daf116ee81e5b298c3914a3cba8a66dd))
 
 - Streamline core architecture and extract recorder/orchestrator bases
