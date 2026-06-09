@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.13.0 (2026-06-09)
+
+### Features
+
+- SimulatedDatafeed made part of core.py
+  ([`2f899cc`](https://github.com/nilskujath/scalpwerk/commit/2f899ccdfc3b732dbad7158d413168e900e44e80))
+
+
 ## v2.12.0 (2026-06-09)
 
 ### Features
