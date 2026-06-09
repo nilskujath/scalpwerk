@@ -3,6 +3,7 @@
 
 # ——— Imports ——————————————————————————————————————————————————————————————————————————
 
+import pickle
 
 # fmt: off
 from abc            import ABC, abstractmethod
@@ -10,9 +11,12 @@ from collections    import defaultdict, deque
 from copy           import deepcopy
 from dataclasses    import dataclass, field, replace
 from enum           import Enum, auto
+from io             import BufferedWriter
+from pathlib        import Path
 from queue          import Queue
 from threading      import Thread
 from time           import time_ns
+from traceback      import format_exc
 from typing         import Protocol, NamedTuple
 from uuid           import UUID, uuid4
 # fmt: on
@@ -130,7 +134,9 @@ class Events:
     class System:
         @dataclass(frozen=True, kw_only=True)
         class Shutdown(EventBase):
-            pass
+            # fmt: off
+            reason:         str
+            # fmt: on
 
     class Datafeed:
         @dataclass(frozen=True, kw_only=True)
@@ -317,7 +323,14 @@ class _ComponentBase(_ComponentLike, ABC):
     def _event_loop(self) -> None:
         while True:
             event = self._queue.get()
-            self._on_event(event)
+            try:
+                self._on_event(event)
+            except Exception:
+                self.emit(
+                    Events.System.Shutdown(
+                        reason=f"{type(self).__name__}: {format_exc()}"
+                    )
+                )
             self._queue.task_done()
             if isinstance(event, Events.System.Shutdown):
                 break
@@ -342,11 +355,32 @@ class _ComponentBase(_ComponentLike, ABC):
         self._event_bus.wait_until_system_idle(exclude=self)
 
 
-# ——— Recorder Base ————————————————————————————————————————————————————————————————————
+# ——— Recorders ————————————————————————————————————————————————————————————————————————
 
 
 class RecorderBase(_ComponentBase, ABC):
     SUBSCRIBE_TO: tuple[type[EventBase], ...] = tuple(EventBase.__subclasses__())
+
+
+class PickleRecorder(RecorderBase):
+    def __init__(self, output_path: Path) -> None:
+        self._output_path: Path = output_path
+        self._file: BufferedWriter | None = None
+        super().__init__()
+
+    def _event_loop(self) -> None:
+        self._output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self._output_path, "wb")
+        try:
+            super()._event_loop()
+        finally:
+            if self._file is not None:
+                self._file.close()
+
+    def _on_event(self, event: EventBase) -> None:
+        assert self._file is not None
+        pickle.dump(event, self._file)
+        self._file.flush()
 
 
 # ——— Datafeed Connector Base ——————————————————————————————————————————————————————————
@@ -381,6 +415,20 @@ class IndicatorBase(ABC):
         self._max_history = max(1, int(max_history))
         self._history: dict[Symbol, deque[float]] = {}
         self._input_indicators: dict[IndicatorName, "IndicatorBase"] = {}
+        self._current_symbol: Symbol | None = None
+
+    def __getitem__(self, key: tuple[Symbol, int]) -> float:  # `self.sma["ES", -1]`
+        symbol, index = key
+        try:
+            return self._history[symbol][index]
+        except IndexError:
+            return float("nan")  # warmup; not enough bars yet
+
+    @property
+    def latest(self) -> float:
+        if self._current_symbol is None:
+            raise RuntimeError("no active symbol")
+        return self[self._current_symbol, -1]
 
     @property
     @abstractmethod
@@ -404,35 +452,33 @@ class IndicatorBase(ABC):
             self._history.setdefault(symbol, deque(maxlen=self._max_history))
 
     def update(self, bar: Events.Datafeed.Bar) -> None:
+        self._current_symbol = bar.symbol
         for indicator in self._input_indicators.values():
             indicator.update(bar)
         # `initialize_symbols` must have been called via `StrategyBase` before this
         self._history[bar.symbol].append(self._compute(bar))
 
-    def __getitem__(self, key: tuple[Symbol, int]) -> float:  # `self.sma["ES", -1]`
-        symbol, index = key
-        try:
-            return self._history[symbol][index]
-        except IndexError:
-            return float("nan")  # warmup; not enough bars yet
-
-    def latest(self, symbol: Symbol) -> float:
-        return self[symbol, -1]
-
 
 # ——— Strategy Base ————————————————————————————————————————————————————————————————————
 
 
-class _ExposureTracker:
+class _BarContext:
+    __slots__ = ("symbol",)
+
     def __init__(self) -> None:
+        self.symbol: Symbol | None = None
+
+
+class _ExposureTracker:
+    def __init__(self, bar_context: _BarContext) -> None:
+        self._bar_context: _BarContext = bar_context
+
         self.working_orders: WorkingOrders = {}
         self.open_positions: OpenPositions = {}
 
         # In-flight requests awaiting broker acknowledgement.
         self.submitted_orders: dict[OrderId, Events.Strategy.SubmitOrder] = {}
         self.submitted_cancellations: dict[OrderId, Events.Strategy.CancelOrder] = {}
-
-        self.current_symbol: Symbol | None = None
 
     def track_order_submission(self, event: Events.Strategy.SubmitOrder) -> None:
         self.submitted_orders[event.order_id] = event
@@ -442,24 +488,24 @@ class _ExposureTracker:
 
     @property
     def position(self) -> SignedQuantity:
-        if self.current_symbol is None:
+        if self._bar_context.symbol is None:
             raise RuntimeError("no active symbol")
-        position = self.open_positions.get(self.current_symbol)
-        return position.signed_qty if position else 0
+        pos = self.open_positions.get(self._bar_context.symbol)
+        return pos.signed_qty if pos else 0
 
     @property
     def cost_basis(self) -> ScaledPrice | None:
-        if self.current_symbol is None:
+        if self._bar_context.symbol is None:
             raise RuntimeError("no active symbol")
-        position = self.open_positions.get(self.current_symbol)
-        return position.cost_basis if position else None
+        pos = self.open_positions.get(self._bar_context.symbol)
+        return pos.cost_basis if pos else None
 
     @property
     def no_working_orders(self) -> bool:
-        if self.current_symbol is None:
+        if self._bar_context.symbol is None:
             raise RuntimeError("no active symbol")
         return not any(
-            order.symbol == self.current_symbol
+            order.symbol == self._bar_context.symbol
             for order in self.working_orders.values()
         )
 
@@ -523,7 +569,8 @@ class _ExposureTracker:
 
 
 class _IndicatorManager:
-    def __init__(self) -> None:
+    def __init__(self, bar_context: _BarContext) -> None:
+        self._bar_context: _BarContext = bar_context
         self._registry: dict[IndicatorName, IndicatorBase] = {}
 
     def register(self, ind: IndicatorBase, symbols: frozenset[Symbol]) -> IndicatorBase:
@@ -538,9 +585,12 @@ class _IndicatorManager:
         for indicator in self._registry.values():
             indicator.update(bar)
 
-    def get_readings_for(self, symbol: Symbol) -> IndicatorReadings:
+    @property
+    def get_readings(self) -> IndicatorReadings:
+        if self._bar_context.symbol is None:
+            raise RuntimeError("no active symbol")
         return {
-            name: IndicatorValue(value=ind.latest(symbol), is_scaled=ind.IS_SCALED)
+            name: IndicatorValue(value=ind.latest, is_scaled=ind.IS_SCALED)
             for name, ind in self._registry.items()
         }
 
@@ -562,8 +612,10 @@ class StrategyBase(_ComponentBase):
 
     def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
-        self.exposure = _ExposureTracker()
-        self._indicators = _IndicatorManager()
+        self._bar_context = _BarContext()
+
+        self.exposure = _ExposureTracker(bar_context=self._bar_context)
+        self._indicators = _IndicatorManager(bar_context=self._bar_context)
         self.emit(
             Events.Strategy.StreamRequest(
                 period_type=self.PERIOD_TYPE, symbols=self.SYMBOLS
@@ -574,11 +626,18 @@ class StrategyBase(_ComponentBase):
         try:
             return self._indicators.register(indicator, self.SYMBOLS)
         except ValueError:
-            self.emit(Events.System.Shutdown())
+            self.emit(
+                Events.System.Shutdown(
+                    reason=f"Duplicate indicator {indicator.name!r}; registering the "
+                    f"same indicator with identical parameters twice shadows the "
+                    f"previous instance in the registry. This leaves the strategy "
+                    f"holding a stale reference that doesn't receive updates."
+                )
+            )
             raise
 
     @abstractmethod
-    def on_bar(self, event: Events.Datafeed.Bar) -> None: ...
+    def on_bar(self, bar: Events.Datafeed.Bar) -> None: ...
 
     # fmt: off
     def submit_order(
@@ -592,12 +651,12 @@ class StrategyBase(_ComponentBase):
         stop_price:     ScaledPrice | None  = None,
     ) -> OrderId:
 
-        if self.exposure.current_symbol is None:
+        if self._bar_context.symbol is None:
             raise RuntimeError()
 
         order_id: OrderId = uuid4()
         event = Events.Strategy.SubmitOrder(
-            symbol          =symbol or self.exposure.current_symbol,
+            symbol          =symbol or self._bar_context.symbol,
             order_id        =order_id,
             order_type      =order_type,
             trade_side      =trade_side,
@@ -633,17 +692,18 @@ class StrategyBase(_ComponentBase):
         if bar.symbol not in self.SYMBOLS or bar.period_type != self.PERIOD_TYPE:
             return
 
-        self.exposure.current_symbol = bar.symbol
+        self._bar_context.symbol = bar.symbol
         self._indicators.update(bar)
         self.emit(
             Events.Strategy.IndicatorUpdate(
                 symbol=bar.symbol,
                 source_event=bar,
-                ind_readings=self._indicators.get_readings_for(bar.symbol),
+                ind_readings=self._indicators.get_readings,
             )
         )
 
         self.on_bar(bar)
+        self._bar_context.symbol = None
 
 
 # ——— Broker Connector Base ————————————————————————————————————————————————————————————

@@ -13,3 +13,5 @@ tests/
 ignore/
 runs/
 ignore/run.py
+convert_pkl.py
+run.py

@@ -78,7 +78,7 @@ class SMA(IndicatorBase):
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
         if bar.symbol not in self._source_value_buffer:
             self._source_value_buffer[bar.symbol] = deque(maxlen=self._period)
-        self._source_value_buffer[bar.symbol].append(self._source.latest(bar.symbol))
+        self._source_value_buffer[bar.symbol].append(self._source.latest)
         if len(self._source_value_buffer[bar.symbol]) < self._period:
             return float("nan")
         return sum(self._source_value_buffer[bar.symbol]) / self._period
@@ -102,7 +102,7 @@ class EMA(IndicatorBase):
         return f"EMA ({self._period}, {self._source.name})"
 
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        val = self._source.latest(bar.symbol)
+        val = self._source.latest
         prev = self[bar.symbol, -1]
 
         if prev == prev:  # not NaN, so already past seed phase
@@ -141,8 +141,8 @@ class SMADetrendOscillator(IndicatorBase):
         return f"Detrend ({self._fast_period}, {self._slow_period})"
 
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        fast = self._fast_sma.latest(bar.symbol)
-        slow = self._slow_sma.latest(bar.symbol)
+        fast = self._fast_sma.latest
+        slow = self._slow_sma.latest
         if fast != fast or slow != slow:  # NaN check
             return float("nan")
         return fast - slow
@@ -165,7 +165,7 @@ class Momentum(IndicatorBase):
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
         if bar.symbol not in self._source_value_buffer:
             self._source_value_buffer[bar.symbol] = deque(maxlen=self._period + 1)
-        self._source_value_buffer[bar.symbol].append(self._source.latest(bar.symbol))
+        self._source_value_buffer[bar.symbol].append(self._source.latest)
         if len(self._source_value_buffer[bar.symbol]) < self._period + 1:
             return float("nan")
         return (
@@ -186,7 +186,7 @@ class Clamp(IndicatorBase):
         return f"Clamp {self._clamp_side.name} ({self._source.name})"
 
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        latest_value = self._source.latest(bar.symbol)
+        latest_value = self._source.latest
         match self._clamp_side:
             case ClampSide.KEEP_POSITIVES:
                 return max(0.0, latest_value)
@@ -235,8 +235,8 @@ class RSI(IndicatorBase):
         return f"RSI ({self._period})"
 
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
-        gain = self._avg_gain.latest(bar.symbol)
-        loss = abs(self._avg_loss.latest(bar.symbol))
+        gain = self._avg_gain.latest
+        loss = abs(self._avg_loss.latest)
         if gain != gain or loss != loss:
             return float("nan")
         if loss == 0:
@@ -272,7 +272,7 @@ class BollingerBand(IndicatorBase):
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
         if bar.symbol not in self._source_value_buffer:
             self._source_value_buffer[bar.symbol] = deque(maxlen=self._period)
-        self._source_value_buffer[bar.symbol].append(self._source.latest(bar.symbol))
+        self._source_value_buffer[bar.symbol].append(self._source.latest)
         if len(self._source_value_buffer[bar.symbol]) < self._period:
             return float("nan")
         buf = list(self._source_value_buffer[bar.symbol])
@@ -309,7 +309,7 @@ class BollingerBandwidth(IndicatorBase):
     def _compute(self, bar: Events.Datafeed.Bar) -> float:
         if bar.symbol not in self._source_value_buffer:
             self._source_value_buffer[bar.symbol] = deque(maxlen=self._period)
-        self._source_value_buffer[bar.symbol].append(self._source.latest(bar.symbol))
+        self._source_value_buffer[bar.symbol].append(self._source.latest)
         if len(self._source_value_buffer[bar.symbol]) < self._period:
             return float("nan")
         buf = list(self._source_value_buffer[bar.symbol])

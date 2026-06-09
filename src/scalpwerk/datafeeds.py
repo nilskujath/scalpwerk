@@ -26,7 +26,7 @@ class CSVDatafeedConnector(DatafeedConnectorBase):
         for bar in self._iter_bars():
             self._wait_until_system_idle()
             self.emit(bar)
-        self.emit(Events.System.Shutdown())
+        self.emit(Events.System.Shutdown(reason="Simulated datafeed exhausted."))
 
     def _iter_bars(self) -> Iterator[Events.Datafeed.Bar]:
         with open(self._csv_path) as f:
