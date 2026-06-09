@@ -405,6 +405,33 @@ class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
                 self._connect()  # connect datafeed only after broker is connected (!)
 
 
+# Reads a pickle file of sequential `Events.Datafeed.Bar` objects.
+class SimulatedDatafeed(DatafeedConnectorBase):
+    def __init__(self, path_to_pkl: Path) -> None:
+        self._path_to_pkl: Path = path_to_pkl
+        self._subscriptions: set[tuple[Symbol, PeriodType]] = set()
+        super().__init__()
+
+    def _subscribe(self, period_type: PeriodType, symbols: frozenset[Symbol]) -> None:
+        for symbol in symbols:
+            self._subscriptions.add((symbol, period_type))
+
+    def _connect(self) -> None:
+        with open(self._path_to_pkl, "rb") as f:
+            while True:
+                try:
+                    bar: Events.Datafeed.Bar = pickle.load(f)
+                except EOFError:
+                    break
+                if (bar.symbol, bar.period_type) in self._subscriptions:
+                    self._wait_until_system_idle()
+                    self.emit(bar)
+        self.emit(Events.System.Shutdown(reason="Reached end of historical data."))
+
+    def _disconnect(self) -> None:
+        pass
+
+
 # ——— Indicator Base ———————————————————————————————————————————————————————————————————
 
 
