@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.12.0 (2026-06-09)
+
+### Features
+
+- Added PickleRecorder to core.py
+  ([`337c99a`](https://github.com/nilskujath/scalpwerk/commit/337c99a5c767a75785f798b9f057eacb362de332))
+
+
 ## v2.11.0 (2026-06-08)
 
 ### Features
