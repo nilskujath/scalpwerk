@@ -44,7 +44,6 @@ class OrderType(Enum):
     # fmt: off
     MARKET      = auto()
     STOP        = auto()
-    STOP_LIMIT  = auto()
     LIMIT       = auto()
     # fmt: on
 
@@ -58,7 +57,6 @@ class TradeSide(Enum):
 
 class TimeInForce(Enum):
     # fmt: off
-    DAY         = auto()
     GTC         = auto()
     # fmt: on
 
@@ -107,6 +105,15 @@ class OpenPosition:
     # fmt: on
 
 
+type WorkingOrders = dict[OrderId, WorkingOrder]
+type OpenPositions = dict[Symbol, OpenPosition]
+
+
+class Exposure(NamedTuple):
+    working_orders: WorkingOrders
+    open_positions: OpenPositions
+
+
 class IndicatorValue(NamedTuple):  # `NamedTuple` for hot-path performance
     # fmt: off
     value:          float
@@ -114,12 +121,7 @@ class IndicatorValue(NamedTuple):  # `NamedTuple` for hot-path performance
     # fmt: on
 
 
-# Complex Type Aliases for Data Structures
-# fmt: off
-type WorkingOrders      = dict[OrderId, WorkingOrder]
-type OpenPositions      = dict[Symbol, OpenPosition]
-type IndicatorReadings  = dict[IndicatorName, IndicatorValue]
-# fmt: on
+type IndicatorReadings = dict[IndicatorName, IndicatorValue]
 
 
 # ——— Event Messages ———————————————————————————————————————————————————————————————————
@@ -176,15 +178,21 @@ class Events:
             order_type:     OrderType
             trade_side:     TradeSide
             qty:            Quantity
-            time_in_force:  TimeInForce
+            time_in_force:  TimeInForce = TimeInForce.GTC
             limit_price:    ScaledPrice | None = None
             stop_price:     ScaledPrice | None = None
             # fmt: on
 
+            def __post_init__(self) -> None:
+                if self.order_type is OrderType.STOP and self.stop_price is None:
+                    raise ValueError("stop order requires `stop_price` to be set")
+                if self.order_type is OrderType.LIMIT and self.limit_price is None:
+                    raise ValueError("limit order requires `limit_price` to be set")
+
         # We do not modify orders; cancel and resubmit is the way. This significantly
         # reduces the surface area and complexity of our system.
         @dataclass(frozen=True, kw_only=True)
-        class CancelOrder(EventBase):
+        class SubmitCancellation(EventBase):
             # fmt: off
             symbol:         Symbol
             order_id:       OrderId
@@ -194,8 +202,7 @@ class Events:
         @dataclass(frozen=True, kw_only=True)
         class BrokerConnected(EventBase):  # carries current exposure; broker is SSOT
             # fmt: off
-            working_orders: WorkingOrders
-            open_positions: OpenPositions
+            exposure:       Exposure
             # fmt: on
 
         @dataclass(frozen=True, kw_only=True)
@@ -505,12 +512,16 @@ class _ExposureTracker:
 
         # In-flight requests awaiting broker acknowledgement.
         self.submitted_orders: dict[OrderId, Events.Strategy.SubmitOrder] = {}
-        self.submitted_cancellations: dict[OrderId, Events.Strategy.CancelOrder] = {}
+        self.submitted_cancellations: dict[
+            OrderId, Events.Strategy.SubmitCancellation
+        ] = {}
 
     def track_order_submission(self, event: Events.Strategy.SubmitOrder) -> None:
         self.submitted_orders[event.order_id] = event
 
-    def track_cancellation_submission(self, event: Events.Strategy.CancelOrder) -> None:
+    def track_cancellation_submission(
+        self, event: Events.Strategy.SubmitCancellation
+    ) -> None:
         self.submitted_cancellations[event.order_id] = event
 
     @property
@@ -539,8 +550,8 @@ class _ExposureTracker:
     def on_event(self, event: EventBase) -> None:
         match event:
             case Events.Broker.BrokerConnected() as event:
-                self.working_orders = event.working_orders
-                self.open_positions = event.open_positions
+                self.working_orders = event.exposure.working_orders
+                self.open_positions = event.exposure.open_positions
 
             case Events.Broker.OrderAccepted() as event:
                 order = self.submitted_orders.pop(event.order_id)
@@ -698,8 +709,10 @@ class StrategyBase(_ComponentBase):
         return order_id
 
     def submit_cancel(self, order_id: OrderId) -> None:
+        if order_id in self.exposure.submitted_cancellations:
+            raise RuntimeError(f"cancellation already in flight for {order_id}")
         order = self.exposure.working_orders[order_id]
-        event = Events.Strategy.CancelOrder(
+        event = Events.Strategy.SubmitCancellation(
             symbol  =order.symbol,
             order_id=order.order_id,
         )
@@ -733,39 +746,193 @@ class StrategyBase(_ComponentBase):
         self._bar_context.symbol = None
 
 
-# ——— Broker Connector Base ————————————————————————————————————————————————————————————
+# ——— Broker Connectors ————————————————————————————————————————————————————————————————
 
 
 class BrokerConnectorBase(_ComponentBase, _Connectable):
     SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
         Events.Strategy.SubmitOrder,
-        Events.Strategy.CancelOrder,
+        Events.Strategy.SubmitCancellation,
     )
 
     def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
         super().__init__(event_bus)
 
         self._connect()
-        working_orders, open_positions = self._exposure_snapshot()
-        self.emit(
-            Events.Broker.BrokerConnected(
-                working_orders=working_orders,
-                open_positions=open_positions,
-            )
-        )
+        self.emit(Events.Broker.BrokerConnected(exposure=self._exposure_snapshot()))
 
     @abstractmethod
-    def _exposure_snapshot(self) -> tuple[WorkingOrders, OpenPositions]: ...
+    def _exposure_snapshot(self) -> Exposure: ...
 
     def _on_event(self, event: EventBase) -> None:
         match event:
             case Events.Strategy.SubmitOrder() as event:
                 self._on_submit_order(event)
-            case Events.Strategy.CancelOrder() as event:
+            case Events.Strategy.SubmitCancellation() as event:
                 self._on_cancel_order(event)
 
     @abstractmethod
     def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None: ...
 
     @abstractmethod
-    def _on_cancel_order(self, event: Events.Strategy.CancelOrder) -> None: ...
+    def _on_cancel_order(self, event: Events.Strategy.SubmitCancellation) -> None: ...
+
+
+class SimulatedBrokerConnector(BrokerConnectorBase):
+    SUBSCRIBE_TO = BrokerConnectorBase.SUBSCRIBE_TO + (Events.Datafeed.Bar,)
+
+    def __init__(self) -> None:
+        self._exposure: Exposure = Exposure(working_orders={}, open_positions={})
+        super().__init__()
+
+    def _connect(self) -> None:
+        pass  # No-op for simulated broker connector
+
+    def _disconnect(self) -> None:
+        pass  # No-op for simulated broker connector
+
+    def _exposure_snapshot(self) -> Exposure:
+        return Exposure(
+            working_orders=self._exposure.working_orders.copy(),
+            open_positions=self._exposure.open_positions.copy(),
+        )
+
+    def _on_event(self, event: EventBase) -> None:
+        match event:
+            case Events.Datafeed.Bar() as bar:
+                self._on_bar(bar)
+            case _:
+                super()._on_event(event)
+
+    def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
+        for order in list(self._exposure.working_orders.values()):  # create snapshot
+            if order.symbol != bar.symbol:
+                continue
+            match order.order_type:
+                case OrderType.MARKET:
+                    self._fill(order=order, price=bar.open, ts=bar.period_start)
+                case OrderType.STOP:
+                    self._try_match_stp(order=order, bar=bar)
+                case OrderType.LIMIT:
+                    self._try_match_lmt(order=order, bar=bar)
+
+    def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None:
+        # fmt: off
+        self._exposure.working_orders[event.order_id] = WorkingOrder(
+            symbol          =event.symbol,
+            order_id        =event.order_id,
+            order_type      =event.order_type,
+            trade_side      =event.trade_side,
+            qty             =event.qty,
+            filled_qty      =0,
+            time_in_force   =event.time_in_force,
+            limit_price     =event.limit_price,
+            stop_price      =event.stop_price,)
+
+        self.emit(Events.Broker.OrderAccepted(
+            timestamp       =event.timestamp,
+            symbol          =event.symbol,
+            order_id        =event.order_id,))
+        # fmt: on
+
+    def _on_cancel_order(self, event: Events.Strategy.SubmitCancellation) -> None:
+        # fmt: off
+        if event.order_id in self._exposure.working_orders:
+            del self._exposure.working_orders[event.order_id]
+            self.emit(Events.Broker.CancellationAccepted(
+                timestamp   =event.timestamp,
+                symbol      =event.symbol,
+                order_id    =event.order_id,))
+        else:
+            self.emit(Events.Broker.CancellationRejected(
+                timestamp   =event.timestamp,
+                symbol      =event.symbol,
+                order_id    =event.order_id,
+                reason      ="order has already been filled",))
+        # fmt: on
+
+    def _try_match_stp(self, order: WorkingOrder, bar: Events.Datafeed.Bar) -> None:
+        assert order.stop_price is not None
+        stp_price = order.stop_price
+        if order.trade_side is TradeSide.BUY and bar.high >= stp_price:
+            self._fill(order=order, price=max(stp_price, bar.open), ts=bar.period_start)
+        elif order.trade_side is TradeSide.SELL and bar.low <= stp_price:
+            self._fill(order=order, price=min(stp_price, bar.open), ts=bar.period_start)
+
+    def _try_match_lmt(self, order: WorkingOrder, bar: Events.Datafeed.Bar) -> None:
+        assert order.limit_price is not None
+        lmt_price = order.limit_price
+        if order.trade_side is TradeSide.BUY and bar.low <= lmt_price:
+            self._fill(order=order, price=min(lmt_price, bar.open), ts=bar.period_start)
+        elif order.trade_side is TradeSide.SELL and bar.high >= lmt_price:
+            self._fill(order=order, price=max(lmt_price, bar.open), ts=bar.period_start)
+
+    def _fill(
+        self, order: WorkingOrder, price: ScaledPrice, ts: NsSinceUnixEpoch
+    ) -> None:
+        del self._exposure.working_orders[order.order_id]
+
+        signed_fill_qty: SignedQuantity = (
+            order.qty if order.trade_side is TradeSide.BUY else -order.qty
+        )
+        existing_position: OpenPosition | None = self._exposure.open_positions.get(
+            order.symbol, None
+        )
+
+        updated_position_cost_basis: ScaledPrice | None
+
+        # If there is no existing position for the symbol, figuring out the updated
+        # `signed_position_size` and `position_cost_basis` is trivial:
+        if existing_position is None:
+            updated_signed_position_size: SignedQuantity = signed_fill_qty
+            updated_position_cost_basis = price
+
+        # If there is an already existing position for the symbol, updating the
+        # `signed_position_size` is trivial, but figuring out the cost basis needs
+        # to observe several cases:
+        else:
+            updated_signed_position_size = (
+                existing_position.signed_qty + signed_fill_qty
+            )
+
+            # Case 1: Position is now flat; so the cost basis needs to be set to `None`
+            if updated_signed_position_size == 0:
+                updated_position_cost_basis = None
+
+            # Case 2: The fill adds to an existing position (same direction)
+            elif existing_position.signed_qty * signed_fill_qty > 0:
+                updated_position_cost_basis = (
+                    existing_position.signed_qty * existing_position.cost_basis
+                    + signed_fill_qty * price
+                ) // updated_signed_position_size
+
+            # Case 3: The fill flips an existing position
+            elif abs(signed_fill_qty) > abs(existing_position.signed_qty):
+                updated_position_cost_basis = price
+
+            # Case 4: The fill reduces an existing position; cost basis stays unchanged
+            else:
+                updated_position_cost_basis = existing_position.cost_basis
+
+        if updated_signed_position_size == 0:
+            self._exposure.open_positions.pop(order.symbol)
+        else:
+            assert updated_position_cost_basis is not None
+            self._exposure.open_positions[order.symbol] = OpenPosition(
+                symbol=order.symbol,
+                signed_qty=updated_signed_position_size,
+                cost_basis=updated_position_cost_basis,
+            )
+
+        # fmt: off
+        self.emit(Events.Broker.Fill(
+            timestamp               =ts,
+            symbol                  =order.symbol,
+            fill_id                 =uuid4(),
+            order_id                =order.order_id,
+            trade_side              =order.trade_side,
+            filled_qty              =order.qty,
+            fill_price              =price,
+            signed_position_size    =updated_signed_position_size,
+            position_cost_basis     =updated_position_cost_basis,))
+        # fmt: on
