@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v2.14.0 (2026-06-11)
+
+### Features
+
+- Integrated simulated broker to core.py
+  ([`6443bbb`](https://github.com/nilskujath/scalpwerk/commit/6443bbb151fc00cfe9e74126b3adb7b8a975eee6))
+
+
 ## v2.13.0 (2026-06-09)
 
 ### Features
