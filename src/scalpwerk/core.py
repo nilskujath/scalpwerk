@@ -27,7 +27,7 @@ from uuid               import UUID, uuid4
 type DequeIndex = int
 type MaxHistory = int
 type NanosecondsSinceUnixEpoch = int
-type PositionSize = int
+type SignedPositionSize = int
 type Quantity = int
 type ScaledPrice = int
 type IndicatorValue = float
@@ -144,7 +144,7 @@ class DomainEvents:
         # This eliminates the need for computing position sizes and cost bases
         # internally, and avoids having to track instrument-specific commissions and
         # fees for each trading action.
-        signed_position_size:   PositionSize
+        signed_position_size:   SignedPositionSize
         position_cost_basis:    ScaledPrice | None = None  # `None` if position is flat
         # fmt: on
 
@@ -174,16 +174,9 @@ class SystemEvents:
 
     @dataclass(frozen=True, kw_only=True)
     class RoundTripCompleted(EventMessageBase):
-        # This event message was designed to capture all events from the first order
-        # submission while flat to the fill that returns the position to flat.
-
         # fmt: off
-        symbol:         Symbol
-        readings:       tuple["SystemEvents.IndicatorUpdate", ...]  # incl. original bar
-        submissions:    tuple[DomainEvents.OrderSubmitted, ...]  # incl. requests
-        cancellations:  tuple[DomainEvents.OrderCancelled, ...]
-        fills:          tuple[DomainEvents.Fill, ...]
-        expiries:       tuple[DomainEvents.OrderExpired, ...]
+        symbol:     Symbol
+        events:     tuple[EventMessageBase, ...]
         # fmt: on
 
 
@@ -410,12 +403,12 @@ class StrategyBase(SystemComponentBase):
         self._pending_orders:   dict[UUID, DomainEvents.OrderRequest] = {}
         self._active_orders:    dict[UUID, DomainEvents.OrderRequest] = {}
         self._pending_cancels:  dict[UUID, DomainEvents.CancellationRequest] = {}
-        self._position:         dict[Symbol, PositionSize] = {}
+        self._position:         dict[Symbol, SignedPositionSize] = {}
         self._cost_basis:       dict[Symbol, ScaledPrice] = {}
         # fmt: on
         super().__init__(event_bus)
 
-    def position(self, symbol: Symbol | None = None) -> PositionSize:
+    def position(self, symbol: Symbol | None = None) -> SignedPositionSize:
         return self._position.get(symbol or self._current_symbol, 0)
 
     def cost_basis(self, symbol: Symbol | None = None) -> ScaledPrice | None:
@@ -582,6 +575,67 @@ class DatafeedConnectorBase(ConnectableSystemComponentBase, ABC):
 # ——————————————————————————————————————————————————————————————————————————————————————
 
 
+class RoundTripTracker(AggregatorBase):
+    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
+        DomainEvents.OrderSubmitted,
+        DomainEvents.OrderCancelled,
+        DomainEvents.Fill,
+        DomainEvents.OrderExpired,
+    )
+
+    def __init__(self, event_bus: EventBus) -> None:
+        self._events: dict[Symbol, list[EventMessageBase]] = {}
+        self._signed_position_size: dict[Symbol, SignedPositionSize] = {}
+        super().__init__(event_bus)
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        symbol = getattr(event, "symbol", None)
+        if symbol is None:
+            return
+
+        if symbol not in self._events:
+            match event:
+                # Synthetic fills on (re-)connection of a broker component can establish
+                # a position without prior working orders.
+                case DomainEvents.OrderSubmitted() | DomainEvents.Fill():
+                    self._events[symbol] = []
+                case _:
+                    return
+
+        self._events[symbol].append(event)
+        if not isinstance(event, DomainEvents.Fill):
+            return
+
+        old_position = self._signed_position_size.get(symbol, 0)
+
+        # Case: fill flattens position
+        if event.signed_position_size == 0:
+            self._signed_position_size.pop(symbol)
+            self.emit(
+                SystemEvents.RoundTripCompleted(
+                    symbol=symbol,
+                    events=tuple(self._events.pop(symbol)),
+                )
+            )
+
+        # Case: fill flips position
+        elif old_position * event.signed_position_size < 0:
+            # Position flipped: close the old round trip and start a new one
+            # with the same fill as the opening event.
+            self.emit(
+                SystemEvents.RoundTripCompleted(
+                    symbol=symbol,
+                    events=tuple(self._events.pop(symbol)),
+                )
+            )
+            self._events[symbol] = [event]
+            self._signed_position_size[symbol] = event.signed_position_size
+
+        # Case: fill adds or reduces position, but doesn't close it
+        else:
+            self._signed_position_size[symbol] = event.signed_position_size
+
+
 # ——————————————————————————————————————————————————————————————————————————————————————
 # Recorders
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -670,7 +724,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
     def __init__(self, event_bus: BacktestEventBus, symbols: set[Symbol]) -> None:
         # fmt: off
         self._working_orders:   dict[UUID, DomainEvents.OrderRequest] = {}
-        self._position:         dict[Symbol, PositionSize] = {}
+        self._position:         dict[Symbol, SignedPositionSize] = {}
         self._cost_basis:       dict[Symbol, ScaledPrice] = {}
         # fmt: on
         super().__init__(event_bus, symbols)
@@ -771,7 +825,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
         # We optimistically model all fills as complete for simplicity.
         del self._working_orders[order.order_id]
 
-        updated_position_size: PositionSize = (
+        updated_position_size: SignedPositionSize = (
             position_size_before_fill + signed_fill_qty
         )
 
