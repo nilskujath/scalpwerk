@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.2.0 (2026-07-08)
+
+### Features
+
+- Added RoundTripCompleted event message
+  ([`aaccd6c`](https://github.com/nilskujath/scalpwerk/commit/aaccd6c08308092d34bf9a0c3545e9187ebd891c))
+
+
 ## v3.1.0 (2026-07-08)
 
 ### Features
