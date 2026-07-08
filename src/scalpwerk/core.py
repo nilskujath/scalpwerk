@@ -105,6 +105,7 @@ class DomainEvents:
         # fmt: off
         symbol:         Symbol
         order_id:       UUID
+        source_request: "DomainEvents.OrderRequest"
         reason:         str
         # fmt: on
 
@@ -169,6 +170,20 @@ class SystemEvents:
         # fmt: off
         source_bar:     "DomainEvents.NewBar"
         readings:       dict[IndicatorName, IndicatorValue]
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class RoundTripCompleted(EventMessageBase):
+        # This event message was designed to capture all events from the first order
+        # submission while flat to the fill that returns the position to flat.
+
+        # fmt: off
+        symbol:         Symbol
+        readings:       tuple["SystemEvents.IndicatorUpdate", ...]  # incl. original bar
+        submissions:    tuple[DomainEvents.OrderSubmitted, ...]  # incl. requests
+        cancellations:  tuple[DomainEvents.OrderCancelled, ...]
+        fills:          tuple[DomainEvents.Fill, ...]
+        expiries:       tuple[DomainEvents.OrderExpired, ...]
         # fmt: on
 
 
