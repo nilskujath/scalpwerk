@@ -38,7 +38,7 @@
 
 ### Bug Fixes
 
-- Raise on duplicate indicator names in add_indicator
+- Raise on duplicate indicator names in add_input
   ([`ec592d0`](https://github.com/nilskujath/scalpwerk/commit/ec592d0c87dc21c188a29a8840969ffc32ec94fb))
 
 ### Features

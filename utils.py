@@ -4,9 +4,7 @@ import pickle
 from dataclasses import asdict
 from pathlib import Path
 
-from src.scalpwerk.core import EventBase, Events, PeriodType
-
-# ——— Data Preparation —————————————————————————————————————————————————————————————————
+from src.scalpwerk.core import EventMessageBase, DomainEvents, PeriodType
 
 
 def convert_databento_csv(csv_path: Path, output_path: Path) -> None:
@@ -24,7 +22,7 @@ def convert_databento_csv(csv_path: Path, output_path: Path) -> None:
             if period is None:
                 continue
             pickle.dump(
-                Events.Datafeed.Bar(
+                DomainEvents.NewBar(
                     symbol=row[col["symbol"]],
                     period_start=int(row[col["ts_event"]]),
                     period_type=period,
@@ -32,17 +30,14 @@ def convert_databento_csv(csv_path: Path, output_path: Path) -> None:
                     high=int(row[col["high"]]),
                     low=int(row[col["low"]]),
                     close=int(row[col["close"]]),
-                    volume=(int(row[col["volume"]]) if row[col["volume"]] else None),
+                    volume=int(row[col["volume"]]),
                 ),
                 f_out,
             )
 
 
-# ——— Event Log Analysis ——————————————————————————————————————————————————————————————
-
-
-def load_events(pkl_path: Path) -> list[EventBase]:
-    events: list[EventBase] = []
+def load_events(pkl_path: Path) -> list[EventMessageBase]:
+    events: list[EventMessageBase] = []
     with open(pkl_path, "rb") as f:
         while True:
             try:

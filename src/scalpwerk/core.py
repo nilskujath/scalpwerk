@@ -1,294 +1,593 @@
-# Author:   Nils Kujath
-
-
-# ——— Imports ——————————————————————————————————————————————————————————————————————————
-
+# fmt: off
 import pickle
 
-# fmt: off
-from abc            import ABC, abstractmethod
-from collections    import defaultdict, deque
-from copy           import deepcopy
-from dataclasses    import dataclass, field, replace
-from enum           import Enum, auto
-from io             import BufferedWriter
-from pathlib        import Path
-from queue          import Queue
-from threading      import Thread
-from time           import time_ns
-from traceback      import format_exc
-from typing         import Protocol, NamedTuple
-from uuid           import UUID, uuid4
+from abc                import ABC, abstractmethod
+from collections        import defaultdict, deque
+from collections.abc    import Generator
+from contextlib         import contextmanager
+from copy               import deepcopy
+from dataclasses        import dataclass, field, replace
+from enum               import Enum
+from io                 import BufferedWriter
+from pathlib            import Path
+from queue              import Queue
+from threading          import Thread
+from time               import time_ns
+from traceback          import format_exc
+from typing             import Protocol
+from uuid               import UUID, uuid4
 # fmt: on
 
 
-# ——— Constants ————————————————————————————————————————————————————————————————————————
+# ——————————————————————————————————————————————————————————————————————————————————————
+# System Infrastructure
+# ——————————————————————————————————————————————————————————————————————————————————————
 
 
-PRICE_SCALE_FACTOR = 1_000_000_000  # to convert prices to fixed-point integers
+type DequeIndex = int
+type MaxHistory = int
+type NanosecondsSinceUnixEpoch = int
+type PositionSize = int
+type Quantity = int
+type ScaledPrice = int
+type IndicatorValue = float
+type IndicatorName = str
+type ShutdownReason = str
+type Symbol = str
 
 
-# ——— Enums ————————————————————————————————————————————————————————————————————————————
-
-
-class PeriodType(Enum):
-    # fmt: off
-    SECOND      = auto()
-    MINUTE      = auto()
-    HOUR        = auto()
-    DAY         = auto()
-    # fmt: on
-
-
-class OrderType(Enum):
-    # fmt: off
-    MARKET      = auto()
-    STOP        = auto()
-    LIMIT       = auto()
-    # fmt: on
-
-
-class TradeSide(Enum):
-    # fmt: off
-    BUY         = auto()
-    SELL        = auto()
-    # fmt: on
-
-
-class TimeInForce(Enum):
-    # fmt: off
-    GTC         = auto()
-    # fmt: on
-
-
-# ——— Type Aliases —————————————————————————————————————————————————————————————————————
-
-
-# fmt: off
-type NsSinceUnixEpoch   = int
-type ScaledPrice        = int
-type Quantity           = int  # absolute, no indication of trade side/direction
-type SignedQuantity     = int  # positive if long/buy, negative if short/sell
-
-type Symbol             = str
-type IndicatorName      = str
-
-type OrderId            = UUID
-type FillId             = UUID
-# fmt: on
-
-
-# ——— Data Structures ——————————————————————————————————————————————————————————————————
+PeriodType = Enum("PeriodType", ["SECOND", "MINUTE", "HOUR", "DAY"])
+TradeSide = Enum("TradeSide", ["BUY", "SELL"])
 
 
 @dataclass(frozen=True, kw_only=True)
-class WorkingOrder:
-    # fmt: off
-    symbol:         Symbol
-    order_id:       OrderId
-    order_type:     OrderType
-    trade_side:     TradeSide
-    qty:            Quantity  # total qty of order, not reduced by (partial) fills
-    filled_qty:     Quantity
-    time_in_force:  TimeInForce
-    limit_price:    ScaledPrice | None = None
-    stop_price:     ScaledPrice | None = None
-    # fmt: on
+class EventMessageBase:
+    timestamp: NanosecondsSinceUnixEpoch = field(default_factory=time_ns)
 
 
-@dataclass(frozen=True, kw_only=True)
-class OpenPosition:
-    # fmt: off
-    symbol:         Symbol
-    signed_qty:     SignedQuantity
-    cost_basis:     ScaledPrice
-    # fmt: on
+class DomainEvents:
+    @dataclass(frozen=True, kw_only=True)
+    class NewBar(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        period_start:   NanosecondsSinceUnixEpoch
+        period_type:    PeriodType
+        open:           ScaledPrice
+        high:           ScaledPrice
+        low:            ScaledPrice
+        close:          ScaledPrice
+        volume:         int
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class OrderRequest(EventMessageBase):
+        # We only allow limit and stop limit orders; market orders and plain stop orders
+        # must be implemented as their limit(ed) counterparts with marketable limit
+        # prices. More sophisticated order types need to be approximated within the
+        # strategy logic as cancel-and-resubmit processes.
+
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        trade_side:     TradeSide
+        qty:            Quantity
+        limit_price:    ScaledPrice
+        stop_price:     ScaledPrice | None = None  # becomes stop-limit order if set
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class CancellationRequest(EventMessageBase):
+        # Note that we do not provide events for order modification; cancel-and-resubmit
+        # is the way (this significantly reduces the surface area and complexity of our
+        # system).
+
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class OrderSubmitted(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        source_request: "DomainEvents.OrderRequest"
+
+        # If `True`, this event was emitted by a broker connector component on
+        # (re-)connect to communicate to the system the working orders that already
+        # exist for the account (it does not represent an acceptance of an order request
+        # submitted during this run).
+        synthetic:      bool = False
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class OrderRejected(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        reason:         str
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class OrderCancelled(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class CancellationRejected(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        reason:         str
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class Fill(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        trade_side:     TradeSide
+        filled_qty:     Quantity
+        remaining_qty:  Quantity
+        fill_price:     ScaledPrice
+
+        # If `True`, this event was emitted by the broker on (re-)connect to communicate
+        # to the system the position state (position size and cost basis for the fill's
+        # symbol) that already exists for the account (it does not represent an actual
+        # execution).
+        synthetic:      bool = False
+
+        # Position state after this fill; broker is single source of truth (SSOT).
+        # This eliminates the need for computing position sizes and cost bases
+        # internally, and avoids having to track instrument-specific commissions and
+        # fees for each trading action.
+        signed_position_size:   PositionSize
+        position_cost_basis:    ScaledPrice | None = None  # `None` if position is flat
+        # fmt: on
+
+    @dataclass(frozen=True, kw_only=True)
+    class OrderExpired(EventMessageBase):
+        # fmt: off
+        symbol:         Symbol
+        order_id:       UUID
+        # fmt: on
 
 
-type WorkingOrders = dict[OrderId, WorkingOrder]
-type OpenPositions = dict[Symbol, OpenPosition]
+class SystemEvents:
+    @dataclass(frozen=True, kw_only=True)
+    class Shutdown(EventMessageBase):
+        reason: ShutdownReason
+
+    @dataclass(frozen=True, kw_only=True)
+    class IndicatorUpdate(EventMessageBase):
+        # This event message was designed to be emitted after updating a set of
+        # indicators with the next new bar inside a strategy, which makes their readings
+        # available to any interested component (e.g., charting).
+
+        # fmt: off
+        source_bar:     "DomainEvents.NewBar"
+        readings:       dict[IndicatorName, IndicatorValue]
+        # fmt: on
 
 
-class Exposure(NamedTuple):
-    working_orders: WorkingOrders
-    open_positions: OpenPositions
+class IndicatorBase(ABC):
+    IS_SCALED: bool = True  # `True` if output is in the same scale as the price data
 
+    def __init__(self, max_history: MaxHistory = 100) -> None:
+        self._max_history = max(1, max_history)
+        self._history: defaultdict[Symbol, deque[IndicatorValue]] = defaultdict(
+            lambda: deque(maxlen=self._max_history)
+        )
+        self._input_indicators: dict[IndicatorName, "IndicatorBase"] = {}
 
-class IndicatorValue(NamedTuple):  # `NamedTuple` for hot-path performance
-    # fmt: off
-    value:          float
-    is_scaled:      bool
-    # fmt: on
-
-
-type IndicatorReadings = dict[IndicatorName, IndicatorValue]
-
-
-# ——— Event Messages ———————————————————————————————————————————————————————————————————
-
-
-@dataclass(frozen=True, kw_only=True)
-class EventBase:  # outside events namespace so nested classes can access it
-    timestamp: NsSinceUnixEpoch = field(default_factory=lambda: time_ns())
-
-
-class Events:
-    class System:
-        @dataclass(frozen=True, kw_only=True)
-        class Shutdown(EventBase):
-            # fmt: off
-            reason:         str
-            # fmt: on
-
-    class Datafeed:
-        @dataclass(frozen=True, kw_only=True)
-        class Bar(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            period_start:   NsSinceUnixEpoch
-            period_type:    PeriodType
-            open:           ScaledPrice
-            high:           ScaledPrice
-            low:            ScaledPrice
-            close:          ScaledPrice
-            volume:         int | None = None
-            # fmt: on
-
-    class Strategy:
-        @dataclass(frozen=True, kw_only=True)
-        class StreamRequest(EventBase):
-            # fmt: off
-            period_type:    PeriodType
-            symbols:        frozenset[Symbol]  # `frozenset` enforces deep immutability
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class IndicatorUpdate(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            source_event:   "Events.Datafeed.Bar"
-            ind_readings:   IndicatorReadings
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class SubmitOrder(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            order_type:     OrderType
-            trade_side:     TradeSide
-            qty:            Quantity
-            time_in_force:  TimeInForce = TimeInForce.GTC
-            limit_price:    ScaledPrice | None = None
-            stop_price:     ScaledPrice | None = None
-            # fmt: on
-
-            def __post_init__(self) -> None:
-                if self.order_type is OrderType.STOP and self.stop_price is None:
-                    raise ValueError("stop order requires `stop_price` to be set")
-                if self.order_type is OrderType.LIMIT and self.limit_price is None:
-                    raise ValueError("limit order requires `limit_price` to be set")
-
-        # We do not modify orders; cancel and resubmit is the way. This significantly
-        # reduces the surface area and complexity of our system.
-        @dataclass(frozen=True, kw_only=True)
-        class SubmitCancellation(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            # fmt: on
-
-    class Broker:
-        @dataclass(frozen=True, kw_only=True)
-        class BrokerConnected(EventBase):  # carries current exposure; broker is SSOT
-            # fmt: off
-            exposure:       Exposure
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class OrderAccepted(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class OrderRejected(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            reason:         str
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class CancellationAccepted(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class CancellationRejected(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            reason:         str
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class Fill(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            fill_id:        FillId
-            order_id:       OrderId
-            trade_side:     TradeSide
-            filled_qty:     Quantity
-            fill_price:     ScaledPrice
-
-            # Position state after this fill; broker is SSOT. This eliminates the need
-            # for computing position sizes and cost bases internally, and avoids having
-            # to track instrument-specific commissions and fees for each trading action.
-            signed_position_size:   SignedQuantity
-            position_cost_basis:    ScaledPrice | None = None  # None when flat
-            # fmt: on
-
-        @dataclass(frozen=True, kw_only=True)
-        class OrderExpired(EventBase):
-            # fmt: off
-            symbol:         Symbol
-            order_id:       OrderId
-            # fmt: on
-
-
-# ——— Event Bus ————————————————————————————————————————————————————————————————————————
-
-
-class _ComponentLike(Protocol):  # protocol to avoid circular dependencies
-    def receive(self, event: EventBase) -> None: ...
+    def __getitem__(self, key: tuple[Symbol, DequeIndex]) -> IndicatorValue:
+        symbol, deque_index = key
+        try:
+            return self._history[symbol][deque_index]
+        except IndexError:
+            return float("nan")
 
     @property
-    def is_idle(self) -> bool: ...  # check if component is currently idle
+    @abstractmethod
+    def name(self) -> IndicatorName:
+        # The name should uniquely identify the indicator and its configuration, e.g.,
+        # `f"Indicator Name ({self.parameter_1}, {self.parameter_2})"`.
+        ...
 
-    def wait_until_idle(self) -> None: ...  # wait until the component is idle
+    def add_input(self, indicator: "IndicatorBase") -> "IndicatorBase":
+        # Defensive deep copy so that, should the same indicator instance be used as
+        # input to multiple parent indicators, it gets an independent copy per parent,
+        # thus preventing double updates.
+        indicator = deepcopy(indicator)
+        # Duplicate names would shadow the previous input, leaving the caller with
+        # a stale reference that silently stops receiving updates.
+        if indicator.name in self._input_indicators:
+            raise ValueError(f"duplicate input indicator {indicator.name!r}")
+        self._input_indicators[indicator.name] = indicator
+        return indicator
+
+    def update(self, bar: DomainEvents.NewBar) -> None:
+        for indicator in self._input_indicators.values():
+            indicator.update(bar)
+        self._history[bar.symbol].append(self._compute(bar))
+
+    @abstractmethod
+    def _compute(self, bar: DomainEvents.NewBar) -> IndicatorValue: ...
+
+
+class SystemComponentLike(Protocol):  # defined to break a circular dependency
+    def receive(self, event: EventMessageBase) -> None: ...
+
+    def wait_until_idle(self) -> None: ...
+
+    @property
+    def is_idle(self) -> bool: ...
 
 
 class EventBus:
     def __init__(self) -> None:
-        self._subs: dict[type[EventBase], set[_ComponentLike]] = defaultdict(set)
+        self._per_eventtype_subscriptions: defaultdict[
+            type[EventMessageBase], set[SystemComponentLike]
+        ] = defaultdict(set)
 
-    def subscribe(self, component: _ComponentLike, *event_types: type[EventBase]):
+    def subscribe(
+        self, component: SystemComponentLike, *event_types: type[EventMessageBase]
+    ) -> None:
         for event_type in event_types:
-            self._subs[event_type].add(component)
+            self._per_eventtype_subscriptions[event_type].add(component)
 
-    def publish(self, event: EventBase):
-        for component in self._subs[type(event)]:
+    def publish(self, event: EventMessageBase) -> None:
+        for component in self._per_eventtype_subscriptions[type(event)]:
             component.receive(event)
 
-    def wait_until_system_idle(self, exclude: _ComponentLike | None = None) -> None:
-        # We need to loop until all components are idle at the same time; this is
-        # because draining one component may enqueue events in a previously drained one.
+
+class SystemComponentBase(ABC):
+    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = ()  # override to receive events
+
+    def __init__(self, event_bus: EventBus) -> None:
+        self._event_bus: EventBus = event_bus
+        self._queue: Queue[EventMessageBase] = Queue()
+        self._thread = Thread(target=self._event_loop, name=type(self).__name__)
+        self._event_bus.subscribe(self, *self.SUBSCRIBE_TO, SystemEvents.Shutdown)
+        self._thread.start()
+
+    @property
+    def is_idle(self) -> bool:
+        return self._queue.unfinished_tasks == 0
+
+    def wait_until_idle(self) -> None:
+        self._queue.join()
+
+    def receive(self, event: EventMessageBase) -> None:
+        # Delivery is fast since the `.receive` (on the calling component's thread) only
+        # puts the event in the queue. The heavy lifting is then done by the event
+        # handlers on each component's own thread.
+        self._queue.put(event)
+
+    def emit(self, event: EventMessageBase) -> None:
+        self._event_bus.publish(event)
+
+    def _event_loop(self) -> None:
         while True:
-            all_components = set().union(*self._subs.values())
+            self._consume(event := self._queue.get())
+            if isinstance(event, SystemEvents.Shutdown):
+                break
+        self._teardown()
+
+    def _consume(self, event: EventMessageBase) -> None:
+        try:
+            self._on_event(event)
+        except Exception:
+            self.emit(SystemEvents.Shutdown(reason=format_exc()))
+        self._queue.task_done()
+
+    # Override this hook to perform component-specific cleanup actions after the event
+    # loop exits.
+    def _teardown(self) -> None:
+        pass
+
+    # Subclasses must implement their event processing logic here.
+    @abstractmethod
+    def _on_event(self, event: EventMessageBase) -> None: ...
+
+
+class ConnectableSystemComponentBase(SystemComponentBase, ABC):
+    def __init__(self, event_bus: EventBus) -> None:
+        super().__init__(event_bus)
+        self._connect()
+
+    @abstractmethod
+    def _connect(self) -> None: ...
+
+    @abstractmethod
+    def _disconnect(self) -> None: ...
+
+    def _teardown(self) -> None:
+        self._disconnect()
+        super()._teardown()
+
+
+class RecorderBase(SystemComponentBase, ABC):
+    # This base class exists to remind that subscribing to all events is the foundation
+    # for creating system observability (subclasses could log, make a dashboard etc.).
+
+    SUBSCRIBE_TO = tuple(
+        member
+        for cls in (DomainEvents, SystemEvents)
+        for member in vars(cls).values()
+        if isinstance(member, type) and issubclass(member, EventMessageBase)
+    )
+
+
+class BrokerConnectorBase(ConnectableSystemComponentBase, ABC):
+    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
+        DomainEvents.OrderRequest,
+        DomainEvents.CancellationRequest,
+    )
+
+    def __init__(self, event_bus: EventBus, symbols: set[Symbol]) -> None:
+        self._symbols = symbols
+        super().__init__(event_bus)
+        self._emit_account_state()
+
+    @abstractmethod
+    def _emit_account_state(self) -> None:
+        # On (re-)connect, the `._emit_account_state` method should be called to emit a
+        # synthetic `DomainEvents.Fill` event for each open position and a synthetic
+        # `DomainEvents.OrderSubmitted` event for each working order to restore each
+        # strategy's internal position, cost basis, and active order state.
+        ...
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        if (s := getattr(event, "symbol", None)) is not None and s not in self._symbols:
+            return
+        match event:
+            case DomainEvents.OrderRequest():
+                self._on_order_request(event)
+            case DomainEvents.CancellationRequest():
+                self._on_cancellation_request(event)
+
+    @abstractmethod
+    def _on_order_request(self, event: DomainEvents.OrderRequest) -> None: ...
+
+    @abstractmethod
+    def _on_cancellation_request(
+        self, event: DomainEvents.CancellationRequest
+    ) -> None: ...
+
+
+class StrategyBase(SystemComponentBase):
+    # Define a strategy by subclassing, registering indicators in `__init__` (via
+    # `register_indicator`), and implementing trading logic in `on_bar`.
+
+    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
+        DomainEvents.NewBar,
+        DomainEvents.OrderSubmitted,
+        DomainEvents.OrderRejected,
+        DomainEvents.OrderCancelled,
+        DomainEvents.CancellationRejected,
+        DomainEvents.Fill,
+        DomainEvents.OrderExpired,
+    )
+
+    @contextmanager
+    def _bar_context(self, symbol: Symbol) -> Generator[None, None, None]:
+        self._current_symbol = symbol
+        try:
+            yield
+        finally:
+            del self._current_symbol
+
+    def __init__(self, event_bus: EventBus, symbols: set[Symbol]) -> None:
+        # fmt: off
+        self._symbols:          set[Symbol] = symbols
+        self._indicators:       dict[IndicatorName, IndicatorBase] = {}
+        self._pending_orders:   dict[UUID, DomainEvents.OrderRequest] = {}
+        self._active_orders:    dict[UUID, DomainEvents.OrderRequest] = {}
+        self._pending_cancels:  dict[UUID, DomainEvents.CancellationRequest] = {}
+        self._position:         dict[Symbol, PositionSize] = {}
+        self._cost_basis:       dict[Symbol, ScaledPrice] = {}
+        # fmt: on
+        super().__init__(event_bus)
+
+    def position(self, symbol: Symbol | None = None) -> PositionSize:
+        return self._position.get(symbol or self._current_symbol, 0)
+
+    def cost_basis(self, symbol: Symbol | None = None) -> ScaledPrice | None:
+        return self._cost_basis.get(symbol or self._current_symbol, None)
+
+    def active_orders(
+        self, symbol: Symbol | None = None
+    ) -> list[DomainEvents.OrderRequest]:
+        symbol = symbol or self._current_symbol
+        return [o for o in self._active_orders.values() if o.symbol == symbol]
+
+    def pending_orders(
+        self, symbol: Symbol | None = None
+    ) -> list[DomainEvents.OrderRequest]:
+        symbol = symbol or self._current_symbol
+        return [po for po in self._pending_orders.values() if po.symbol == symbol]
+
+    def pending_cancels(
+        self, symbol: Symbol | None = None
+    ) -> list[DomainEvents.CancellationRequest]:
+        symbol = symbol or self._current_symbol
+        return [c for c in self._pending_cancels.values() if c.symbol == symbol]
+
+    @abstractmethod
+    def on_bar(self, event: DomainEvents.NewBar) -> None: ...
+
+    def register_indicator(self, indicator: IndicatorBase) -> IndicatorBase:
+        if indicator.name in self._indicators:
+            # `SystemEvents.Shutdown` brings down already-running components; the raise
+            # crashes the caller with a traceback.
+            self.emit(SystemEvents.Shutdown(reason=f"duplicate {indicator.name!r}."))
+            raise ValueError(f"duplicate {indicator.name!r}.")
+        self._indicators[indicator.name] = indicator
+        return indicator
+
+    def submit_order(
+        self,
+        trade_side: TradeSide,
+        qty: Quantity,
+        limit_price: ScaledPrice,
+        stop_price: ScaledPrice | None = None,
+        symbol: Symbol | None = None,  # `None` to use current symbol within `on_bar`
+    ) -> UUID:
+        event = DomainEvents.OrderRequest(
+            symbol=symbol or self._current_symbol,
+            order_id=(order_id := uuid4()),
+            trade_side=trade_side,
+            qty=qty,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+        self._pending_orders[order_id] = event
+        self.emit(event)
+        return order_id
+
+    def submit_cancel(self, order_id: UUID) -> None:
+        event = DomainEvents.CancellationRequest(
+            symbol=self._active_orders[order_id].symbol,
+            order_id=order_id,
+        )
+        self._pending_cancels[order_id] = event
+        self.emit(event)
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        # Two strategies on the same bus must not trade the same symbol: they would
+        # receive each other's fills and order lifecycle events, causing conflicting
+        # state transitions. This is an inherent consequence of the broker-as-SSOT
+        # mechanism (cf. DomainEvents.Fill).
+        if (s := getattr(event, "symbol", None)) is not None and s not in self._symbols:
+            return
+        match event:
+            case DomainEvents.NewBar():
+                self._on_new_bar(event)
+            case DomainEvents.OrderSubmitted():
+                self._on_order_submitted(event)
+            case DomainEvents.OrderRejected():
+                self._on_order_rejected(event)
+            case DomainEvents.OrderCancelled():
+                self._on_order_cancelled(event)
+            case DomainEvents.CancellationRejected():
+                self._on_cancellation_rejected(event)
+            case DomainEvents.Fill():
+                self._on_fill(event)
+            case DomainEvents.OrderExpired():
+                self._on_order_expired(event)
+
+    def _on_new_bar(self, event: DomainEvents.NewBar) -> None:
+        with self._bar_context(event.symbol):
+            self._update_indicators(event)
+            self.on_bar(event)
+
+    def _update_indicators(self, event: DomainEvents.NewBar) -> None:
+        readings = {}
+        for indicator in self._indicators.values():
+            indicator.update(event)
+            readings[indicator.name] = indicator[event.symbol, -1]
+        self.emit(
+            SystemEvents.IndicatorUpdate(
+                source_bar=event,
+                readings=readings,
+            )
+        )
+
+    def _on_order_submitted(self, event: DomainEvents.OrderSubmitted) -> None:
+        if event.synthetic:
+            self._active_orders[event.order_id] = event.source_request
+            return
+        self._active_orders[event.order_id] = self._pending_orders.pop(event.order_id)
+
+    def _on_order_rejected(self, event: DomainEvents.OrderRejected) -> None:
+        self._pending_orders.pop(event.order_id)
+
+    def _on_order_cancelled(self, event: DomainEvents.OrderCancelled) -> None:
+        self._pending_cancels.pop(event.order_id)
+        self._active_orders.pop(event.order_id)
+
+    def _on_cancellation_rejected(
+        self, event: DomainEvents.CancellationRejected
+    ) -> None:
+        # Defensively pop with `None` as default because a fill or expiration may have
+        # already cleared the entry in `_pending_cancels` before this event message was
+        # processed.
+        self._pending_cancels.pop(event.order_id, None)
+
+    def _on_fill(self, event: DomainEvents.Fill) -> None:
+        if event.synthetic:
+            self._position[event.symbol] = event.signed_position_size
+            assert event.position_cost_basis is not None
+            self._cost_basis[event.symbol] = event.position_cost_basis
+            return
+        # Defensively pop with `None` as default because a cancellation request may not
+        # have been in flight.
+        self._pending_cancels.pop(event.order_id, None)
+        if event.remaining_qty == 0:
+            self._active_orders.pop(event.order_id)
+        if event.signed_position_size == 0:
+            self._position.pop(event.symbol)
+            self._cost_basis.pop(event.symbol)
+        else:
+            self._position[event.symbol] = event.signed_position_size
+            assert event.position_cost_basis is not None
+            self._cost_basis[event.symbol] = event.position_cost_basis
+
+    def _on_order_expired(self, event: DomainEvents.OrderExpired) -> None:
+        self._active_orders.pop(event.order_id)
+        # Defensively pop with `None` as default because a cancellation request may not
+        # have been in flight.
+        self._pending_cancels.pop(event.order_id, None)
+
+
+class DatafeedConnectorBase(ConnectableSystemComponentBase, ABC):
+    def __init__(
+        self, event_bus: EventBus, symbols: set[tuple[Symbol, PeriodType]]
+    ) -> None:
+        self._symbols = symbols
+        super().__init__(event_bus)
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        pass
+
+
+# ——————————————————————————————————————————————————————————————————————————————————————
+# Backtesting Toolset
+# ——————————————————————————————————————————————————————————————————————————————————————
+
+
+class BacktestEventBus(EventBus):
+    def publish(self, event: EventMessageBase) -> None:
+        if not isinstance(event, DomainEvents.NewBar):
+            super().publish(event)
+            return
+
+        # In live trading, fills happen during a bar and the new bar event arrives after
+        # the bar closes, so strategies naturally see fills before they see the (then
+        # closed) bar during which they happened.
+        # In backtesting, therefore, simulated broker components must evaluate fills
+        # against each bar before strategies receive the bar, which is why we need a
+        # two-phased delivery mechanism if we want to use simulated broker components.
+
+        for subscriber in self._per_eventtype_subscriptions[type(event)]:  # Phase 1
+            if isinstance(subscriber, BrokerConnectorBase):
+                subscriber.receive(event)
+        self.wait_until_system_idle()
+
+        for subscriber in self._per_eventtype_subscriptions[type(event)]:  # Phase 2
+            if not isinstance(subscriber, BrokerConnectorBase):
+                subscriber.receive(event)
+
+    def wait_until_system_idle(
+        self, exclude: SystemComponentLike | None = None
+    ) -> None:
+        # Processing events in one component may cause new events to land in other
+        # components' queues, so we loop until all components are simultaneously idle.
+        while True:
+            all_components = set().union(*self._per_eventtype_subscriptions.values())
             if exclude is not None:
                 all_components.discard(exclude)
             for component in all_components:
@@ -297,83 +596,225 @@ class EventBus:
                 break
 
 
-_system_event_bus = EventBus()  # global so standard use case is simplified
+class SimulatedBrokerConnector(BrokerConnectorBase):
+    SUBSCRIBE_TO = BrokerConnectorBase.SUBSCRIBE_TO + (DomainEvents.NewBar,)
+
+    def __init__(self, event_bus: BacktestEventBus, symbols: set[Symbol]) -> None:
+        # fmt: off
+        self._working_orders:   dict[UUID, DomainEvents.OrderRequest] = {}
+        self._position:         dict[Symbol, PositionSize] = {}
+        self._cost_basis:       dict[Symbol, ScaledPrice] = {}
+        # fmt: on
+        super().__init__(event_bus, symbols)
+
+    def _connect(self) -> None:
+        pass
+
+    def _disconnect(self) -> None:
+        pass
+
+    def _emit_account_state(self) -> None:
+        pass
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        match event:
+            case DomainEvents.NewBar():
+                self._on_bar(event)
+            case _:
+                super()._on_event(event)
+
+    def _on_order_request(self, event: DomainEvents.OrderRequest) -> None:
+        # Note that (for simplicity) orders are treated as GTC with no expiration.
+        self._working_orders[event.order_id] = event
+        self.emit(
+            DomainEvents.OrderSubmitted(
+                symbol=event.symbol,
+                order_id=event.order_id,
+                source_request=event,
+            )
+        )
+
+    def _on_cancellation_request(self, event: DomainEvents.CancellationRequest) -> None:
+        # Safe to hard-delete because two-phase bar delivery guarantees the strategy
+        # has seen all fills before it can issue a cancel.
+        del self._working_orders[event.order_id]
+        self.emit(
+            DomainEvents.OrderCancelled(
+                symbol=event.symbol,
+                order_id=event.order_id,
+            )
+        )
+
+    def _on_bar(self, bar: DomainEvents.NewBar) -> None:
+        for order in list(self._working_orders.values()):
+            if order.symbol != bar.symbol:
+                continue
+            if order.stop_price is not None:
+                self._try_trigger_stop(order, bar)
+            else:
+                self._try_fill_limit(order, bar)
+
+    def _try_fill_limit(
+        self, order: DomainEvents.OrderRequest, bar: DomainEvents.NewBar
+    ) -> None:
+        # We conservatively assume no fill if the limit price is just touched.
+        if order.trade_side is TradeSide.BUY and bar.low < order.limit_price:
+            self._fill(order=order, fill_price=min(order.limit_price, bar.open))
+        elif order.trade_side is TradeSide.SELL and bar.high > order.limit_price:
+            self._fill(order=order, fill_price=max(order.limit_price, bar.open))
+
+    def _try_trigger_stop(
+        self, order: DomainEvents.OrderRequest, bar: DomainEvents.NewBar
+    ) -> None:
+        assert order.stop_price is not None
+
+        stop_triggered = (
+            order.trade_side is TradeSide.BUY and bar.high >= order.stop_price
+        ) or (order.trade_side is TradeSide.SELL and bar.low <= order.stop_price)
+        if not stop_triggered:
+            return
+
+        limit_order = DomainEvents.OrderRequest(
+            symbol=order.symbol,
+            order_id=order.order_id,
+            trade_side=order.trade_side,
+            qty=order.qty,
+            limit_price=order.limit_price,
+            stop_price=None,
+        )
+        self._working_orders[order.order_id] = limit_order
+
+        # The limit order can either serve as slippage protection beyond the stop level
+        # or fish for a pullback after the breakout. We fill slippage protection orders
+        # at the stop price (optimistically disregarding slippage for simplicity) and
+        # defer pullback orders to the next bar since bar data cannot confirm the
+        # retracement occurred after the stop triggered.
+        if order.trade_side is TradeSide.BUY and order.limit_price >= order.stop_price:
+            self._fill(order=limit_order, fill_price=order.stop_price)
+        elif (
+            order.trade_side is TradeSide.SELL and order.limit_price <= order.stop_price
+        ):
+            self._fill(order=limit_order, fill_price=order.stop_price)
+
+    def _fill(self, order: DomainEvents.OrderRequest, fill_price: ScaledPrice) -> None:
+        position_size_before_fill = self._position.get(order.symbol, 0)
+        signed_fill_qty = order.qty if order.trade_side is TradeSide.BUY else -order.qty
+
+        # We optimistically model all fills as complete for simplicity.
+        del self._working_orders[order.order_id]
+
+        updated_position_size: PositionSize = (
+            position_size_before_fill + signed_fill_qty
+        )
+
+        # Weighted average cost basis, not FIFO. The two methods produce identical total
+        # PnL per round trip (flat to flat); they only diverge in per-fill attribution
+        # after partial reductions. If a strategy uses cost basis as a decision input
+        # with partial reductions, the live broker must use the same accounting method
+        # for the backtest to be accurate (since the broker is the SSOT).
+        updated_cost_basis: ScaledPrice | None
+
+        # Case: fill opens new position
+        if position_size_before_fill == 0:
+            updated_cost_basis = fill_price
+
+        # Case: fill adds to position
+        elif position_size_before_fill * signed_fill_qty > 0:
+            updated_cost_basis = (
+                position_size_before_fill * self._cost_basis[order.symbol]
+                + signed_fill_qty * fill_price
+            ) // updated_position_size
+
+        # Case: fill flips position
+        elif position_size_before_fill * updated_position_size < 0:
+            updated_cost_basis = fill_price
+
+        # Case: fill flattens existing position
+        elif updated_position_size == 0:
+            updated_cost_basis = None
+
+        # Case: fill reduces position (but neither flips nor flattens it)
+        else:
+            updated_cost_basis = self._cost_basis[order.symbol]
+
+        self.emit(
+            DomainEvents.Fill(
+                symbol=order.symbol,
+                order_id=order.order_id,
+                trade_side=order.trade_side,
+                filled_qty=order.qty,
+                remaining_qty=0,
+                fill_price=fill_price,
+                signed_position_size=updated_position_size,
+                position_cost_basis=updated_cost_basis,
+            )
+        )
+
+        if updated_position_size == 0:
+            self._position.pop(order.symbol)
+            self._cost_basis.pop(order.symbol)
+        else:
+            self._position[order.symbol] = updated_position_size
+            assert updated_cost_basis is not None
+            self._cost_basis[order.symbol] = updated_cost_basis
 
 
-# ——— Component Base ———————————————————————————————————————————————————————————————————
+class SimulatedDatafeed(DatafeedConnectorBase):
+    def __init__(
+        self,
+        event_bus: BacktestEventBus,
+        symbols: set[tuple[Symbol, PeriodType]],
+        path_to_pkl: Path,
+        max_bars: int | None = None,
+    ) -> None:
+        # Pickle file needs to contain a chronological succession of objects of type
+        # `DomainEvents.NewBar`.
+        self._path_to_pkl = path_to_pkl
+        # Second reference to the same event bus; needed because the parent annotates
+        # `_event_bus` as `EventBus`, which does not have `wait_until_system_idle`.
+        self._backtest_bus = event_bus
+        self._max_bars = max_bars
+        super().__init__(event_bus, symbols)
+
+    def _connect(self) -> None:
+        bars_emitted = 0
+        with open(self._path_to_pkl, "rb") as f:
+            while True:
+                try:
+                    bar = pickle.load(f)
+                except EOFError:
+                    break
+                if (bar.symbol, bar.period_type) in self._symbols:
+                    # Replace the stale serialization timestamp with current timestamp.
+                    self.emit(replace(bar, timestamp=time_ns()))
+                    bars_emitted += 1
+                    if self._max_bars is not None and bars_emitted == self._max_bars:
+                        break
+
+        self._backtest_bus.wait_until_system_idle(exclude=self)
+        self.emit(
+            SystemEvents.Shutdown(
+                reason=f"end of historical data: ({bars_emitted} bars emitted)"
+            )
+        )
+
+    def _disconnect(self) -> None:
+        pass
 
 
-class _Connectable(ABC):  # mixin interface for components with connection lifecycles
-    @abstractmethod
-    def _connect(self) -> None: ...
-
-    @abstractmethod
-    def _disconnect(self) -> None: ...
-
-
-class _ComponentBase(_ComponentLike, ABC):
-    SUBSCRIBE_TO: tuple[type[EventBase], ...] = ()
-
-    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
-        self._event_bus: EventBus = event_bus
-        self._event_bus.subscribe(self, *self.SUBSCRIBE_TO, Events.System.Shutdown)
-        self._queue: Queue[EventBase] = Queue()
-        self._thread: Thread = Thread(target=self._event_loop, name=type(self).__name__)
-        self._thread.start()
-
-    def receive(self, event: EventBase) -> None:
-        self._queue.put(event)
-
-    def emit(self, event: EventBase) -> None:
-        self._event_bus.publish(event)
-
-    def _event_loop(self) -> None:
-        while True:
-            event = self._queue.get()
-            try:
-                self._on_event(event)
-            except Exception:
-                self.emit(
-                    Events.System.Shutdown(
-                        reason=f"{type(self).__name__}: {format_exc()}"
-                    )
-                )
-            self._queue.task_done()
-            if isinstance(event, Events.System.Shutdown):
-                break
-        if isinstance(self, _Connectable):
-            self._disconnect()
-
-    @abstractmethod
-    def _on_event(self, event: EventBase) -> None: ...
-
-    # System Pacing Utilities
-    @property
-    def is_idle(self) -> bool:  # non-blocking; `True` if queue is empty
-        return self._queue.unfinished_tasks == 0
-
-    def wait_until_idle(self) -> None:  # blocking; blocks until queue is drained
-        self._queue.join()
-
-    def wait_until_shutdown(self) -> None:  # blocks until this component is done
-        self._thread.join()
-
-    def _wait_until_system_idle(self) -> None:  # block until all other components idle
-        self._event_bus.wait_until_system_idle(exclude=self)
-
-
-# ——— Recorders ————————————————————————————————————————————————————————————————————————
-
-
-class RecorderBase(_ComponentBase, ABC):
-    SUBSCRIBE_TO: tuple[type[EventBase], ...] = tuple(EventBase.__subclasses__())
+# ——————————————————————————————————————————————————————————————————————————————————————
+# Recorders
+# ——————————————————————————————————————————————————————————————————————————————————————
 
 
 class PickleRecorder(RecorderBase):
-    def __init__(self, output_path: Path) -> None:
-        self._output_path: Path = output_path
+    # Events are persisted as native Python objects via pickle (no conversion code is
+    # needed, but the log would break if event dataclass fields are renamed or removed).
+
+    def __init__(self, event_bus: EventBus, output_path: Path) -> None:
+        self._output_path = output_path
         self._file: BufferedWriter | None = None
-        super().__init__()
+        super().__init__(event_bus)
 
     def _event_loop(self) -> None:
         self._output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -381,558 +822,9 @@ class PickleRecorder(RecorderBase):
         try:
             super()._event_loop()
         finally:
-            if self._file is not None:
-                self._file.close()
+            self._file.close()
 
-    def _on_event(self, event: EventBase) -> None:
+    def _on_event(self, event: EventMessageBase) -> None:
         assert self._file is not None
         pickle.dump(event, self._file)
         self._file.flush()
-
-
-# ——— Datafeed Connector Base ——————————————————————————————————————————————————————————
-
-
-class DatafeedConnectorBase(_ComponentBase, _Connectable, ABC):
-    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
-        Events.Strategy.StreamRequest,
-        Events.Broker.BrokerConnected,
-    )
-
-    @abstractmethod
-    def _subscribe(
-        self, period_type: PeriodType, symbols: frozenset[Symbol]
-    ) -> None: ...
-
-    def _on_event(self, event: EventBase) -> None:
-        match event:
-            case Events.Strategy.StreamRequest() as event:
-                self._subscribe(period_type=event.period_type, symbols=event.symbols)
-            case Events.Broker.BrokerConnected():
-                self._connect()  # connect datafeed only after broker is connected (!)
-
-
-# Reads a pickle file of sequential `Events.Datafeed.Bar` objects.
-class SimulatedDatafeed(DatafeedConnectorBase):
-    def __init__(self, path_to_pkl: Path) -> None:
-        self._path_to_pkl: Path = path_to_pkl
-        self._subscriptions: set[tuple[Symbol, PeriodType]] = set()
-        super().__init__()
-
-    def _subscribe(self, period_type: PeriodType, symbols: frozenset[Symbol]) -> None:
-        for symbol in symbols:
-            self._subscriptions.add((symbol, period_type))
-
-    def _connect(self) -> None:
-        with open(self._path_to_pkl, "rb") as f:
-            while True:
-                try:
-                    bar: Events.Datafeed.Bar = pickle.load(f)
-                except EOFError:
-                    break
-                if (bar.symbol, bar.period_type) in self._subscriptions:
-                    self._wait_until_system_idle()
-                    self.emit(bar)
-        self.emit(Events.System.Shutdown(reason="Reached end of historical data."))
-
-    def _disconnect(self) -> None:
-        pass
-
-
-# ——— Indicator Base ———————————————————————————————————————————————————————————————————
-
-
-class IndicatorBase(ABC):
-    IS_SCALED: bool = True  # `True` if output is `ScaledPrice` (e.g., `False` for RSI)
-
-    def __init__(self, max_history: int = 100) -> None:
-        self._max_history = max(1, int(max_history))
-        self._history: dict[Symbol, deque[float]] = {}
-        self._input_indicators: dict[IndicatorName, "IndicatorBase"] = {}
-        self._current_symbol: Symbol | None = None
-
-    def __getitem__(self, key: tuple[Symbol, int]) -> float:  # `self.sma["ES", -1]`
-        symbol, index = key
-        try:
-            return self._history[symbol][index]
-        except IndexError:
-            return float("nan")  # warmup; not enough bars yet
-
-    @property
-    def latest(self) -> float:
-        if self._current_symbol is None:
-            raise RuntimeError("no active symbol")
-        return self[self._current_symbol, -1]
-
-    @property
-    @abstractmethod
-    def name(self) -> IndicatorName: ...  # use f-string to put parameter values in name
-
-    @abstractmethod
-    def _compute(self, bar: Events.Datafeed.Bar) -> float: ...
-
-    def add_indicator(self, indicator: "IndicatorBase") -> "IndicatorBase":
-        indicator = deepcopy(indicator)  # so shared sources don't multi-update per bar
-        if indicator.name in self._input_indicators:  # avoid silent shadowing
-            raise ValueError(f"duplicate input indicator {indicator.name!r}")
-        self._input_indicators[indicator.name] = indicator
-        return indicator
-
-    def initialize_symbols(self, symbols: frozenset[Symbol]) -> None:
-        # Seed deques so `__getitem__` `IndexError` -> warmup (NaN), `KeyError` -> bug.
-        for indicator in self._input_indicators.values():
-            indicator.initialize_symbols(symbols)
-        for symbol in symbols:
-            self._history.setdefault(symbol, deque(maxlen=self._max_history))
-
-    def update(self, bar: Events.Datafeed.Bar) -> None:
-        self._current_symbol = bar.symbol
-        for indicator in self._input_indicators.values():
-            indicator.update(bar)
-        # `initialize_symbols` must have been called via `StrategyBase` before this
-        self._history[bar.symbol].append(self._compute(bar))
-
-
-# ——— Strategy Base ————————————————————————————————————————————————————————————————————
-
-
-class _BarContext:
-    __slots__ = ("symbol",)
-
-    def __init__(self) -> None:
-        self.symbol: Symbol | None = None
-
-
-class _ExposureTracker:
-    def __init__(self, bar_context: _BarContext) -> None:
-        self._bar_context: _BarContext = bar_context
-
-        self.working_orders: WorkingOrders = {}
-        self.open_positions: OpenPositions = {}
-
-        # In-flight requests awaiting broker acknowledgement.
-        self.submitted_orders: dict[OrderId, Events.Strategy.SubmitOrder] = {}
-        self.submitted_cancellations: dict[
-            OrderId, Events.Strategy.SubmitCancellation
-        ] = {}
-
-    def track_order_submission(self, event: Events.Strategy.SubmitOrder) -> None:
-        self.submitted_orders[event.order_id] = event
-
-    def track_cancellation_submission(
-        self, event: Events.Strategy.SubmitCancellation
-    ) -> None:
-        self.submitted_cancellations[event.order_id] = event
-
-    @property
-    def position(self) -> SignedQuantity:
-        if self._bar_context.symbol is None:
-            raise RuntimeError("no active symbol")
-        pos = self.open_positions.get(self._bar_context.symbol)
-        return pos.signed_qty if pos else 0
-
-    @property
-    def cost_basis(self) -> ScaledPrice | None:
-        if self._bar_context.symbol is None:
-            raise RuntimeError("no active symbol")
-        pos = self.open_positions.get(self._bar_context.symbol)
-        return pos.cost_basis if pos else None
-
-    @property
-    def no_working_orders(self) -> bool:
-        if self._bar_context.symbol is None:
-            raise RuntimeError("no active symbol")
-        return not any(
-            order.symbol == self._bar_context.symbol
-            for order in self.working_orders.values()
-        )
-
-    def on_event(self, event: EventBase) -> None:
-        match event:
-            case Events.Broker.BrokerConnected() as event:
-                self.working_orders = event.exposure.working_orders
-                self.open_positions = event.exposure.open_positions
-
-            case Events.Broker.OrderAccepted() as event:
-                order = self.submitted_orders.pop(event.order_id)
-                self.working_orders[event.order_id] = WorkingOrder(
-                    symbol=order.symbol,
-                    order_id=order.order_id,
-                    order_type=order.order_type,
-                    trade_side=order.trade_side,
-                    qty=order.qty,
-                    filled_qty=0,
-                    time_in_force=order.time_in_force,
-                    stop_price=order.stop_price,
-                    limit_price=order.limit_price,
-                )
-
-            case Events.Broker.OrderRejected() as event:
-                self.submitted_orders.pop(event.order_id)
-
-            case Events.Broker.CancellationAccepted() as event:
-                self.submitted_cancellations.pop(event.order_id)
-                self.working_orders.pop(event.order_id)
-
-            case Events.Broker.CancellationRejected() as event:
-                # Pop with `None` since order might have been filled in the meantime.
-                self.submitted_cancellations.pop(event.order_id, None)
-
-            case Events.Broker.Fill() as event:
-                working_order = self.working_orders[event.order_id]
-                if working_order.qty - working_order.filled_qty - event.filled_qty:
-                    self.working_orders[event.order_id] = replace(
-                        working_order,
-                        filled_qty=working_order.filled_qty + event.filled_qty,
-                    )
-                else:
-                    self.working_orders.pop(event.order_id)
-                    self.submitted_cancellations.pop(event.order_id, None)
-
-                # Update position tracking for symbol; fill event carries SOT
-                if event.signed_position_size == 0:
-                    self.open_positions.pop(event.symbol)
-                else:
-                    assert event.position_cost_basis is not None
-                    self.open_positions[event.symbol] = OpenPosition(
-                        symbol=event.symbol,
-                        signed_qty=event.signed_position_size,
-                        cost_basis=event.position_cost_basis,
-                    )
-
-            case Events.Broker.OrderExpired() as event:
-                self.working_orders.pop(event.order_id)
-                # Cancellation might have been in-flight right before order expired
-                self.submitted_cancellations.pop(event.order_id, None)
-
-
-class _IndicatorManager:
-    def __init__(self, bar_context: _BarContext) -> None:
-        self._bar_context: _BarContext = bar_context
-        self._registry: dict[IndicatorName, IndicatorBase] = {}
-
-    def register(self, ind: IndicatorBase, symbols: frozenset[Symbol]) -> IndicatorBase:
-        ind = deepcopy(ind)
-        if ind.name in self._registry:
-            raise ValueError(f"duplicate indicator {ind.name!r}")
-        ind.initialize_symbols(symbols)
-        self._registry[ind.name] = ind
-        return ind
-
-    def update(self, bar: Events.Datafeed.Bar) -> None:
-        for indicator in self._registry.values():
-            indicator.update(bar)
-
-    @property
-    def get_readings(self) -> IndicatorReadings:
-        if self._bar_context.symbol is None:
-            raise RuntimeError("no active symbol")
-        return {
-            name: IndicatorValue(value=ind.latest, is_scaled=ind.IS_SCALED)
-            for name, ind in self._registry.items()
-        }
-
-
-class StrategyBase(_ComponentBase):
-    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
-        Events.Datafeed.Bar,
-        Events.Broker.BrokerConnected,
-        Events.Broker.OrderAccepted,
-        Events.Broker.OrderRejected,
-        Events.Broker.CancellationAccepted,
-        Events.Broker.CancellationRejected,
-        Events.Broker.Fill,
-        Events.Broker.OrderExpired,
-    )
-
-    SYMBOLS: frozenset[Symbol] = frozenset()
-    PERIOD_TYPE: PeriodType = PeriodType.SECOND
-
-    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
-        super().__init__(event_bus)
-        self._bar_context = _BarContext()
-
-        self.exposure = _ExposureTracker(bar_context=self._bar_context)
-        self._indicators = _IndicatorManager(bar_context=self._bar_context)
-        self.emit(
-            Events.Strategy.StreamRequest(
-                period_type=self.PERIOD_TYPE, symbols=self.SYMBOLS
-            )
-        )
-
-    def add_indicator(self, indicator: IndicatorBase) -> IndicatorBase:
-        try:
-            return self._indicators.register(indicator, self.SYMBOLS)
-        except ValueError:
-            self.emit(
-                Events.System.Shutdown(
-                    reason=f"Duplicate indicator {indicator.name!r}; registering the "
-                    f"same indicator with identical parameters twice shadows the "
-                    f"previous instance in the registry. This leaves the strategy "
-                    f"holding a stale reference that doesn't receive updates."
-                )
-            )
-            raise
-
-    @abstractmethod
-    def on_bar(self, bar: Events.Datafeed.Bar) -> None: ...
-
-    # fmt: off
-    def submit_order(
-        self,
-        order_type:     OrderType,
-        trade_side:     TradeSide,
-        qty:            Quantity,
-        symbol:         Symbol      | None  = None,
-        time_in_force:  TimeInForce         = TimeInForce.GTC,
-        limit_price:    ScaledPrice | None  = None,
-        stop_price:     ScaledPrice | None  = None,
-    ) -> OrderId:
-
-        if self._bar_context.symbol is None:
-            raise RuntimeError()
-
-        order_id: OrderId = uuid4()
-        event = Events.Strategy.SubmitOrder(
-            symbol          =symbol or self._bar_context.symbol,
-            order_id        =order_id,
-            order_type      =order_type,
-            trade_side      =trade_side,
-            qty             =qty,
-            time_in_force   =time_in_force,
-            limit_price     =limit_price,
-            stop_price      =stop_price,
-        )
-        self.exposure.track_order_submission(event)
-        self.emit(event)
-        
-        return order_id
-
-    def submit_cancel(self, order_id: OrderId) -> None:
-        if order_id in self.exposure.submitted_cancellations:
-            raise RuntimeError(f"cancellation already in flight for {order_id}")
-        order = self.exposure.working_orders[order_id]
-        event = Events.Strategy.SubmitCancellation(
-            symbol  =order.symbol,
-            order_id=order.order_id,
-        )
-        self.exposure.track_cancellation_submission(event)
-        self.emit(event)
-    # fmt: on
-
-    def _on_event(self, event: EventBase) -> None:
-        match event:
-            case Events.Datafeed.Bar() as event:
-                self._process_bar(event)
-
-            case _:
-                self.exposure.on_event(event)
-
-    def _process_bar(self, bar: Events.Datafeed.Bar) -> None:
-        if bar.symbol not in self.SYMBOLS or bar.period_type != self.PERIOD_TYPE:
-            return
-
-        self._bar_context.symbol = bar.symbol
-        self._indicators.update(bar)
-        self.emit(
-            Events.Strategy.IndicatorUpdate(
-                symbol=bar.symbol,
-                source_event=bar,
-                ind_readings=self._indicators.get_readings,
-            )
-        )
-
-        self.on_bar(bar)
-        self._bar_context.symbol = None
-
-
-# ——— Broker Connectors ————————————————————————————————————————————————————————————————
-
-
-class BrokerConnectorBase(_ComponentBase, _Connectable):
-    SUBSCRIBE_TO: tuple[type[EventBase], ...] = (
-        Events.Strategy.SubmitOrder,
-        Events.Strategy.SubmitCancellation,
-    )
-
-    def __init__(self, event_bus: EventBus = _system_event_bus) -> None:
-        super().__init__(event_bus)
-
-        self._connect()
-        self.emit(Events.Broker.BrokerConnected(exposure=self._exposure_snapshot()))
-
-    @abstractmethod
-    def _exposure_snapshot(self) -> Exposure: ...
-
-    def _on_event(self, event: EventBase) -> None:
-        match event:
-            case Events.Strategy.SubmitOrder() as event:
-                self._on_submit_order(event)
-            case Events.Strategy.SubmitCancellation() as event:
-                self._on_cancel_order(event)
-
-    @abstractmethod
-    def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None: ...
-
-    @abstractmethod
-    def _on_cancel_order(self, event: Events.Strategy.SubmitCancellation) -> None: ...
-
-
-class SimulatedBrokerConnector(BrokerConnectorBase):
-    SUBSCRIBE_TO = BrokerConnectorBase.SUBSCRIBE_TO + (Events.Datafeed.Bar,)
-
-    def __init__(self) -> None:
-        self._exposure: Exposure = Exposure(working_orders={}, open_positions={})
-        super().__init__()
-
-    def _connect(self) -> None:
-        pass  # No-op for simulated broker connector
-
-    def _disconnect(self) -> None:
-        pass  # No-op for simulated broker connector
-
-    def _exposure_snapshot(self) -> Exposure:
-        return Exposure(
-            working_orders=self._exposure.working_orders.copy(),
-            open_positions=self._exposure.open_positions.copy(),
-        )
-
-    def _on_event(self, event: EventBase) -> None:
-        match event:
-            case Events.Datafeed.Bar() as bar:
-                self._on_bar(bar)
-            case _:
-                super()._on_event(event)
-
-    def _on_bar(self, bar: Events.Datafeed.Bar) -> None:
-        for order in list(self._exposure.working_orders.values()):  # create snapshot
-            if order.symbol != bar.symbol:
-                continue
-            match order.order_type:
-                case OrderType.MARKET:
-                    self._fill(order=order, price=bar.open, ts=bar.period_start)
-                case OrderType.STOP:
-                    self._try_match_stp(order=order, bar=bar)
-                case OrderType.LIMIT:
-                    self._try_match_lmt(order=order, bar=bar)
-
-    def _on_submit_order(self, event: Events.Strategy.SubmitOrder) -> None:
-        # fmt: off
-        self._exposure.working_orders[event.order_id] = WorkingOrder(
-            symbol          =event.symbol,
-            order_id        =event.order_id,
-            order_type      =event.order_type,
-            trade_side      =event.trade_side,
-            qty             =event.qty,
-            filled_qty      =0,
-            time_in_force   =event.time_in_force,
-            limit_price     =event.limit_price,
-            stop_price      =event.stop_price,)
-
-        self.emit(Events.Broker.OrderAccepted(
-            timestamp       =event.timestamp,
-            symbol          =event.symbol,
-            order_id        =event.order_id,))
-        # fmt: on
-
-    def _on_cancel_order(self, event: Events.Strategy.SubmitCancellation) -> None:
-        # fmt: off
-        if event.order_id in self._exposure.working_orders:
-            del self._exposure.working_orders[event.order_id]
-            self.emit(Events.Broker.CancellationAccepted(
-                timestamp   =event.timestamp,
-                symbol      =event.symbol,
-                order_id    =event.order_id,))
-        else:
-            self.emit(Events.Broker.CancellationRejected(
-                timestamp   =event.timestamp,
-                symbol      =event.symbol,
-                order_id    =event.order_id,
-                reason      ="order has already been filled",))
-        # fmt: on
-
-    def _try_match_stp(self, order: WorkingOrder, bar: Events.Datafeed.Bar) -> None:
-        assert order.stop_price is not None
-        stp_price = order.stop_price
-        if order.trade_side is TradeSide.BUY and bar.high >= stp_price:
-            self._fill(order=order, price=max(stp_price, bar.open), ts=bar.period_start)
-        elif order.trade_side is TradeSide.SELL and bar.low <= stp_price:
-            self._fill(order=order, price=min(stp_price, bar.open), ts=bar.period_start)
-
-    def _try_match_lmt(self, order: WorkingOrder, bar: Events.Datafeed.Bar) -> None:
-        assert order.limit_price is not None
-        lmt_price = order.limit_price
-        if order.trade_side is TradeSide.BUY and bar.low <= lmt_price:
-            self._fill(order=order, price=min(lmt_price, bar.open), ts=bar.period_start)
-        elif order.trade_side is TradeSide.SELL and bar.high >= lmt_price:
-            self._fill(order=order, price=max(lmt_price, bar.open), ts=bar.period_start)
-
-    def _fill(
-        self, order: WorkingOrder, price: ScaledPrice, ts: NsSinceUnixEpoch
-    ) -> None:
-        del self._exposure.working_orders[order.order_id]
-
-        signed_fill_qty: SignedQuantity = (
-            order.qty if order.trade_side is TradeSide.BUY else -order.qty
-        )
-        existing_position: OpenPosition | None = self._exposure.open_positions.get(
-            order.symbol, None
-        )
-
-        updated_position_cost_basis: ScaledPrice | None
-
-        # If there is no existing position for the symbol, figuring out the updated
-        # `signed_position_size` and `position_cost_basis` is trivial:
-        if existing_position is None:
-            updated_signed_position_size: SignedQuantity = signed_fill_qty
-            updated_position_cost_basis = price
-
-        # If there is an already existing position for the symbol, updating the
-        # `signed_position_size` is trivial, but figuring out the cost basis needs
-        # to observe several cases:
-        else:
-            updated_signed_position_size = (
-                existing_position.signed_qty + signed_fill_qty
-            )
-
-            # Case 1: Position is now flat; so the cost basis needs to be set to `None`
-            if updated_signed_position_size == 0:
-                updated_position_cost_basis = None
-
-            # Case 2: The fill adds to an existing position (same direction)
-            elif existing_position.signed_qty * signed_fill_qty > 0:
-                updated_position_cost_basis = (
-                    existing_position.signed_qty * existing_position.cost_basis
-                    + signed_fill_qty * price
-                ) // updated_signed_position_size
-
-            # Case 3: The fill flips an existing position
-            elif abs(signed_fill_qty) > abs(existing_position.signed_qty):
-                updated_position_cost_basis = price
-
-            # Case 4: The fill reduces an existing position; cost basis stays unchanged
-            else:
-                updated_position_cost_basis = existing_position.cost_basis
-
-        if updated_signed_position_size == 0:
-            self._exposure.open_positions.pop(order.symbol)
-        else:
-            assert updated_position_cost_basis is not None
-            self._exposure.open_positions[order.symbol] = OpenPosition(
-                symbol=order.symbol,
-                signed_qty=updated_signed_position_size,
-                cost_basis=updated_position_cost_basis,
-            )
-
-        # fmt: off
-        self.emit(Events.Broker.Fill(
-            timestamp               =ts,
-            symbol                  =order.symbol,
-            fill_id                 =uuid4(),
-            order_id                =order.order_id,
-            trade_side              =order.trade_side,
-            filled_qty              =order.qty,
-            fill_price              =price,
-            signed_position_size    =updated_signed_position_size,
-            position_cost_basis     =updated_position_cost_basis,))
-        # fmt: on
