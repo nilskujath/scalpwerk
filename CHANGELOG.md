@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.1.0 (2026-07-08)
+
+### Features
+
+- Added PickleRecorder.replay
+  ([`e9b7278`](https://github.com/nilskujath/scalpwerk/commit/e9b7278c09ab1fb01cb5bcdfbf19775a2e98d0ac))
+
+
 ## v3.0.0 (2026-07-08)
 
 ### Features
