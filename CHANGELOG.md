@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.0.0 (2026-07-08)
+
+### Features
+
+- Add two-phase bar delivery
+  ([`1f4e6ca`](https://github.com/nilskujath/scalpwerk/commit/1f4e6ca57cdbdd6920592006f710fcf519a53288))
+
+
 ## v2.14.0 (2026-06-11)
 
 ### Features
