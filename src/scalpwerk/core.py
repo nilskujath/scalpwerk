@@ -325,8 +325,9 @@ class ConnectableSystemComponentBase(SystemComponentBase, ABC):
 
 
 class RecorderBase(SystemComponentBase, ABC):
-    # This base class exists to remind that subscribing to all events is the foundation
-    # for creating system observability (subclasses could log, make a dashboard etc.).
+    # This base class exists to establish recorders as a recognized architectural
+    # role in the system. Recorders subscribe to every event type and persist them
+    # outside the system (e.g., to disk) without emitting anything back onto the bus.
 
     SUBSCRIBE_TO = tuple(
         member
@@ -334,6 +335,13 @@ class RecorderBase(SystemComponentBase, ABC):
         for member in vars(cls).values()
         if isinstance(member, type) and issubclass(member, EventMessageBase)
     )
+
+
+class AggregatorBase(SystemComponentBase, ABC):
+    # This base class exists to establish aggregators as a recognized architectural
+    # role in the system. Aggregators consume events and emit derived events that
+    # communicate higher-level state to other components (e.g., round trip tracking).
+    pass
 
 
 class BrokerConnectorBase(ConnectableSystemComponentBase, ABC):
@@ -567,6 +575,51 @@ class DatafeedConnectorBase(ConnectableSystemComponentBase, ABC):
 
     def _on_event(self, event: EventMessageBase) -> None:
         pass
+
+
+# ——————————————————————————————————————————————————————————————————————————————————————
+# Aggregators
+# ——————————————————————————————————————————————————————————————————————————————————————
+
+
+# ——————————————————————————————————————————————————————————————————————————————————————
+# Recorders
+# ——————————————————————————————————————————————————————————————————————————————————————
+
+
+class PickleRecorder(RecorderBase):
+    # Events are persisted as native Python objects via pickle (no conversion code is
+    # needed, but the log would break if event dataclass fields are renamed or removed).
+
+    def __init__(self, event_bus: EventBus, output_path: Path) -> None:
+        self._output_path = output_path
+        self._file: BufferedWriter | None = None
+        super().__init__(event_bus)
+
+    def _event_loop(self) -> None:
+        self._output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self._output_path, "wb")
+        try:
+            super()._event_loop()
+        finally:
+            self._file.close()
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        assert self._file is not None
+        pickle.dump(event, self._file)
+        self._file.flush()
+
+    @staticmethod
+    def replay(event_bus: EventBus, path: Path) -> None:
+        with open(path, "rb") as f:
+            while True:
+                try:
+                    event = pickle.load(f)
+                except EOFError:
+                    break
+                if not isinstance(event, SystemEvents.Shutdown):
+                    event_bus.publish(event)
+        event_bus.publish(SystemEvents.Shutdown(reason="end of replay"))
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -815,43 +868,3 @@ class SimulatedDatafeed(DatafeedConnectorBase):
 
     def _disconnect(self) -> None:
         pass
-
-
-# ——————————————————————————————————————————————————————————————————————————————————————
-# Recorders
-# ——————————————————————————————————————————————————————————————————————————————————————
-
-
-class PickleRecorder(RecorderBase):
-    # Events are persisted as native Python objects via pickle (no conversion code is
-    # needed, but the log would break if event dataclass fields are renamed or removed).
-
-    def __init__(self, event_bus: EventBus, output_path: Path) -> None:
-        self._output_path = output_path
-        self._file: BufferedWriter | None = None
-        super().__init__(event_bus)
-
-    def _event_loop(self) -> None:
-        self._output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = open(self._output_path, "wb")
-        try:
-            super()._event_loop()
-        finally:
-            self._file.close()
-
-    def _on_event(self, event: EventMessageBase) -> None:
-        assert self._file is not None
-        pickle.dump(event, self._file)
-        self._file.flush()
-
-    @staticmethod
-    def replay(event_bus: EventBus, path: Path) -> None:
-        with open(path, "rb") as f:
-            while True:
-                try:
-                    event = pickle.load(f)
-                except EOFError:
-                    break
-                if not isinstance(event, SystemEvents.Shutdown):
-                    event_bus.publish(event)
-        event_bus.publish(SystemEvents.Shutdown(reason="end of replay"))
