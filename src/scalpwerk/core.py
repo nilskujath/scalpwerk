@@ -828,3 +828,15 @@ class PickleRecorder(RecorderBase):
         assert self._file is not None
         pickle.dump(event, self._file)
         self._file.flush()
+
+    @staticmethod
+    def replay(event_bus: EventBus, path: Path) -> None:
+        with open(path, "rb") as f:
+            while True:
+                try:
+                    event = pickle.load(f)
+                except EOFError:
+                    break
+                if not isinstance(event, SystemEvents.Shutdown):
+                    event_bus.publish(event)
+        event_bus.publish(SystemEvents.Shutdown(reason="end of replay"))
