@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.3.0 (2026-07-08)
+
+### Features
+
+- Added AggregatorBase as recognized architectural role
+  ([`23d2310`](https://github.com/nilskujath/scalpwerk/commit/23d23103ff1fc6647bad5bbba7d0da7a7c8b82b0))
+
+
 ## v3.2.0 (2026-07-08)
 
 ### Features
