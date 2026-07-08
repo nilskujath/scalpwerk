@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.4.0 (2026-07-08)
+
+### Features
+
+- Added RoundTripTracker, renamed PositionSize to SignedPositionSize
+  ([`44d440c`](https://github.com/nilskujath/scalpwerk/commit/44d440c790d5a4dca772f8551e14800d3cfb0478))
+
+
 ## v3.3.0 (2026-07-08)
 
 ### Features
