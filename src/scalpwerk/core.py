@@ -172,13 +172,6 @@ class SystemEvents:
         readings:       dict[IndicatorName, IndicatorValue]
         # fmt: on
 
-    @dataclass(frozen=True, kw_only=True)
-    class RoundTripCompleted(EventMessageBase):
-        # fmt: off
-        symbol:     Symbol
-        events:     tuple[EventMessageBase, ...]
-        # fmt: on
-
 
 class IndicatorBase(ABC):
     IS_SCALED: bool = True  # `True` if output is in the same scale as the price data
@@ -319,21 +312,8 @@ class ConnectableSystemComponentBase(SystemComponentBase, ABC):
 
 class RecorderBase(SystemComponentBase, ABC):
     # This base class exists to establish recorders as a recognized architectural
-    # role in the system. Recorders subscribe to every event type and persist them
-    # outside the system (e.g., to disk) without emitting anything back onto the bus.
-
-    SUBSCRIBE_TO = tuple(
-        member
-        for cls in (DomainEvents, SystemEvents)
-        for member in vars(cls).values()
-        if isinstance(member, type) and issubclass(member, EventMessageBase)
-    )
-
-
-class AggregatorBase(SystemComponentBase, ABC):
-    # This base class exists to establish aggregators as a recognized architectural
-    # role in the system. Aggregators consume events and emit derived events that
-    # communicate higher-level state to other components (e.g., round trip tracking).
+    # role in the system. Recorders consume events and produce output outside the
+    # system (e.g., files, charts) without emitting anything back onto the bus.
     pass
 
 
@@ -571,72 +551,6 @@ class DatafeedConnectorBase(ConnectableSystemComponentBase, ABC):
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
-# Aggregators
-# ——————————————————————————————————————————————————————————————————————————————————————
-
-
-class RoundTripTracker(AggregatorBase):
-    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
-        DomainEvents.OrderSubmitted,
-        DomainEvents.OrderCancelled,
-        DomainEvents.Fill,
-        DomainEvents.OrderExpired,
-    )
-
-    def __init__(self, event_bus: EventBus) -> None:
-        self._events: dict[Symbol, list[EventMessageBase]] = {}
-        self._signed_position_size: dict[Symbol, SignedPositionSize] = {}
-        super().__init__(event_bus)
-
-    def _on_event(self, event: EventMessageBase) -> None:
-        symbol = getattr(event, "symbol", None)
-        if symbol is None:
-            return
-
-        if symbol not in self._events:
-            match event:
-                # Synthetic fills on (re-)connection of a broker component can establish
-                # a position without prior working orders.
-                case DomainEvents.OrderSubmitted() | DomainEvents.Fill():
-                    self._events[symbol] = []
-                case _:
-                    return
-
-        self._events[symbol].append(event)
-        if not isinstance(event, DomainEvents.Fill):
-            return
-
-        old_position = self._signed_position_size.get(symbol, 0)
-
-        # Case: fill flattens position
-        if event.signed_position_size == 0:
-            self._signed_position_size.pop(symbol)
-            self.emit(
-                SystemEvents.RoundTripCompleted(
-                    symbol=symbol,
-                    events=tuple(self._events.pop(symbol)),
-                )
-            )
-
-        # Case: fill flips position
-        elif old_position * event.signed_position_size < 0:
-            # Position flipped: close the old round trip and start a new one
-            # with the same fill as the opening event.
-            self.emit(
-                SystemEvents.RoundTripCompleted(
-                    symbol=symbol,
-                    events=tuple(self._events.pop(symbol)),
-                )
-            )
-            self._events[symbol] = [event]
-            self._signed_position_size[symbol] = event.signed_position_size
-
-        # Case: fill adds or reduces position, but doesn't close it
-        else:
-            self._signed_position_size[symbol] = event.signed_position_size
-
-
-# ——————————————————————————————————————————————————————————————————————————————————————
 # Recorders
 # ——————————————————————————————————————————————————————————————————————————————————————
 
@@ -644,6 +558,13 @@ class RoundTripTracker(AggregatorBase):
 class PickleRecorder(RecorderBase):
     # Events are persisted as native Python objects via pickle (no conversion code is
     # needed, but the log would break if event dataclass fields are renamed or removed).
+
+    SUBSCRIBE_TO = tuple(
+        member
+        for cls in (DomainEvents, SystemEvents)
+        for member in vars(cls).values()
+        if isinstance(member, type) and issubclass(member, EventMessageBase)
+    )
 
     def __init__(self, event_bus: EventBus, output_path: Path) -> None:
         self._output_path = output_path
@@ -674,6 +595,82 @@ class PickleRecorder(RecorderBase):
                 if not isinstance(event, SystemEvents.Shutdown):
                     event_bus.publish(event)
         event_bus.publish(SystemEvents.Shutdown(reason="end of replay"))
+
+
+class TradeRecorder(RecorderBase):
+    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
+        DomainEvents.Fill,
+        SystemEvents.IndicatorUpdate,
+    )
+
+    def __init__(
+        self,
+        event_bus: EventBus,
+        output_dir: Path,
+    ) -> None:
+        self._output_dir: Path = output_dir
+        self._signed_position_size: dict[Symbol, SignedPositionSize] = {}
+        self._trade_count: defaultdict[Symbol, int] = defaultdict(lambda: 0)
+
+        self._current_roundtrip_fills: dict[Symbol, list[DomainEvents.Fill]] = {}
+        self._current_roundtrip_readings: dict[
+            Symbol, list[SystemEvents.IndicatorUpdate]
+        ] = {}
+
+        super().__init__(event_bus)
+
+    def _on_event(self, event: EventMessageBase) -> None:
+        match event:
+            case DomainEvents.Fill():
+                self._on_fill(event=event)
+            case SystemEvents.IndicatorUpdate():
+                self._on_indicator_update(event=event)
+
+    def _on_fill(self, event: DomainEvents.Fill) -> None:
+        symbol = event.symbol
+
+        if symbol not in self._current_roundtrip_fills:
+            self._current_roundtrip_fills[symbol] = []
+            self._current_roundtrip_readings[symbol] = []
+
+        self._current_roundtrip_fills[symbol].append(event)
+
+        # Case: fill flattens position
+        if event.signed_position_size == 0:
+            self._signed_position_size.pop(symbol)
+            self._trade_count[symbol] += 1
+            self._persist_trade(symbol=symbol)
+
+        # Case: fill flips position
+        elif self._signed_position_size.get(symbol, 0) * event.signed_position_size < 0:
+            self._trade_count[symbol] += 1
+            self._persist_trade(symbol=symbol)
+
+            # On a position flip, close the old roundtrip and start a new one with the
+            # same fill as the opening event.
+            self._current_roundtrip_fills[symbol] = [event]
+            self._current_roundtrip_readings[symbol] = []
+            self._signed_position_size[symbol] = event.signed_position_size
+
+        # Case: fill adds to or reduces position, but doesn't close or flip it
+        else:
+            self._signed_position_size[symbol] = event.signed_position_size
+
+    def _on_indicator_update(self, event: SystemEvents.IndicatorUpdate) -> None:
+        symbol = event.source_bar.symbol
+        if symbol in self._current_roundtrip_readings:
+            self._current_roundtrip_readings[symbol].append(event)
+
+    def _persist_trade(self, symbol: Symbol) -> None:
+        trade_dir: Path = self._output_dir / symbol / f"{self._trade_count[symbol]:09d}"
+        trade_dir.mkdir(parents=True, exist_ok=True)
+
+        with open(trade_dir / "fills.pkl", "wb") as f:
+            for fill in self._current_roundtrip_fills.pop(symbol):
+                pickle.dump(fill, f)
+        with open(trade_dir / "readings.pkl", "wb") as f:
+            for reading in self._current_roundtrip_readings.pop(symbol):
+                pickle.dump(reading, f)
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————
@@ -830,7 +827,7 @@ class SimulatedBrokerConnector(BrokerConnectorBase):
         )
 
         # Weighted average cost basis, not FIFO. The two methods produce identical total
-        # PnL per round trip (flat to flat); they only diverge in per-fill attribution
+        # PnL per roundtrip (flat to flat); they only diverge in per-fill attribution
         # after partial reductions. If a strategy uses cost basis as a decision input
         # with partial reductions, the live broker must use the same accounting method
         # for the backtest to be accurate (since the broker is the SSOT).
