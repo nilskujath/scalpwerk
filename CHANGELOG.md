@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.5.0 (2026-07-11)
+
+### Features
+
+- Added TradeRecorder, removed AggregatorBase and RoundtripTracker
+  ([`680bacd`](https://github.com/nilskujath/scalpwerk/commit/680bacddf57f569cee09544c7178568cf6149071))
+
+
 ## v3.4.0 (2026-07-08)
 
 ### Features
