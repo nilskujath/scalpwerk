@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v3.6.0 (2026-07-19)
+
+### Features
+
+- Added Chartist with trade charts, trade journey, and PnL summary
+  ([`036627d`](https://github.com/nilskujath/scalpwerk/commit/036627d6cd25d57be02d9ab47e8302c97fc972cf))
+
+
 ## v3.5.0 (2026-07-11)
 
 ### Features
