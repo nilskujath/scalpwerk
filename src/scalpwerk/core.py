@@ -30,14 +30,26 @@ type NanosecondsSinceUnixEpoch = int
 type SignedPositionSize = int
 type Quantity = int
 type ScaledPrice = int
+type ChartPlotGroup = int
 type IndicatorValue = float
+type IsScaled = bool
 type IndicatorName = str
 type ShutdownReason = str
 type Symbol = str
+type CSSColor = str
+type IndicatorReading = tuple[IndicatorValue, IsScaled, IndicatorPlotConfig]
 
 
 PeriodType = Enum("PeriodType", ["SECOND", "MINUTE", "HOUR", "DAY"])
 TradeSide = Enum("TradeSide", ["BUY", "SELL"])
+PlotStyle = Enum("PlotStyle", ["SOLID", "DASHED", "DOTTED", "DASHDOT", "HISTOGRAM"])
+
+
+@dataclass(frozen=True, kw_only=True)
+class IndicatorPlotConfig:
+    plot_group: ChartPlotGroup | None = None
+    color: CSSColor | None = None
+    style: PlotStyle = PlotStyle.SOLID
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -169,7 +181,7 @@ class SystemEvents:
 
         # fmt: off
         source_bar:     "DomainEvents.NewBar"
-        readings:       dict[IndicatorName, IndicatorValue]
+        readings:       dict[IndicatorName, IndicatorReading]
         # fmt: on
 
 
@@ -380,6 +392,7 @@ class StrategyBase(SystemComponentBase):
         # fmt: off
         self._symbols:          set[Symbol] = symbols
         self._indicators:       dict[IndicatorName, IndicatorBase] = {}
+        self._chart_configs:    dict[IndicatorName, IndicatorPlotConfig] = {}
         self._pending_orders:   dict[UUID, DomainEvents.OrderRequest] = {}
         self._active_orders:    dict[UUID, DomainEvents.OrderRequest] = {}
         self._pending_cancels:  dict[UUID, DomainEvents.CancellationRequest] = {}
@@ -415,13 +428,20 @@ class StrategyBase(SystemComponentBase):
     @abstractmethod
     def on_bar(self, event: DomainEvents.NewBar) -> None: ...
 
-    def register_indicator(self, indicator: IndicatorBase) -> IndicatorBase:
+    def register_indicator(
+        self, indicator: IndicatorBase, chart_config: IndicatorPlotConfig | None = None
+    ) -> IndicatorBase:
         if indicator.name in self._indicators:
             # `SystemEvents.Shutdown` brings down already-running components; the raise
             # crashes the caller with a traceback.
             self.emit(SystemEvents.Shutdown(reason=f"duplicate {indicator.name!r}."))
             raise ValueError(f"duplicate {indicator.name!r}.")
         self._indicators[indicator.name] = indicator
+
+        # Chart config can be set here for convenience since the strategy author knows
+        # each indicator and how they relate visually (e.g., which panel, which color).
+        # This can be overwritten at render time by the chart rendering component.
+        self._chart_configs[indicator.name] = chart_config or IndicatorPlotConfig()
         return indicator
 
     def submit_order(
@@ -481,10 +501,14 @@ class StrategyBase(SystemComponentBase):
             self.on_bar(event)
 
     def _update_indicators(self, event: DomainEvents.NewBar) -> None:
-        readings = {}
+        readings: dict[IndicatorName, IndicatorReading] = {}
         for indicator in self._indicators.values():
             indicator.update(event)
-            readings[indicator.name] = indicator[event.symbol, -1]
+            readings[indicator.name] = (
+                indicator[event.symbol, -1],
+                indicator.IS_SCALED,
+                self._chart_configs[indicator.name],
+            )
         self.emit(
             SystemEvents.IndicatorUpdate(
                 source_bar=event,
@@ -595,82 +619,6 @@ class PickleRecorder(RecorderBase):
                 if not isinstance(event, SystemEvents.Shutdown):
                     event_bus.publish(event)
         event_bus.publish(SystemEvents.Shutdown(reason="end of replay"))
-
-
-class TradeRecorder(RecorderBase):
-    SUBSCRIBE_TO: tuple[type[EventMessageBase], ...] = (
-        DomainEvents.Fill,
-        SystemEvents.IndicatorUpdate,
-    )
-
-    def __init__(
-        self,
-        event_bus: EventBus,
-        output_dir: Path,
-    ) -> None:
-        self._output_dir: Path = output_dir
-        self._signed_position_size: dict[Symbol, SignedPositionSize] = {}
-        self._trade_count: defaultdict[Symbol, int] = defaultdict(lambda: 0)
-
-        self._current_roundtrip_fills: dict[Symbol, list[DomainEvents.Fill]] = {}
-        self._current_roundtrip_readings: dict[
-            Symbol, list[SystemEvents.IndicatorUpdate]
-        ] = {}
-
-        super().__init__(event_bus)
-
-    def _on_event(self, event: EventMessageBase) -> None:
-        match event:
-            case DomainEvents.Fill():
-                self._on_fill(event=event)
-            case SystemEvents.IndicatorUpdate():
-                self._on_indicator_update(event=event)
-
-    def _on_fill(self, event: DomainEvents.Fill) -> None:
-        symbol = event.symbol
-
-        if symbol not in self._current_roundtrip_fills:
-            self._current_roundtrip_fills[symbol] = []
-            self._current_roundtrip_readings[symbol] = []
-
-        self._current_roundtrip_fills[symbol].append(event)
-
-        # Case: fill flattens position
-        if event.signed_position_size == 0:
-            self._signed_position_size.pop(symbol)
-            self._trade_count[symbol] += 1
-            self._persist_trade(symbol=symbol)
-
-        # Case: fill flips position
-        elif self._signed_position_size.get(symbol, 0) * event.signed_position_size < 0:
-            self._trade_count[symbol] += 1
-            self._persist_trade(symbol=symbol)
-
-            # On a position flip, close the old roundtrip and start a new one with the
-            # same fill as the opening event.
-            self._current_roundtrip_fills[symbol] = [event]
-            self._current_roundtrip_readings[symbol] = []
-            self._signed_position_size[symbol] = event.signed_position_size
-
-        # Case: fill adds to or reduces position, but doesn't close or flip it
-        else:
-            self._signed_position_size[symbol] = event.signed_position_size
-
-    def _on_indicator_update(self, event: SystemEvents.IndicatorUpdate) -> None:
-        symbol = event.source_bar.symbol
-        if symbol in self._current_roundtrip_readings:
-            self._current_roundtrip_readings[symbol].append(event)
-
-    def _persist_trade(self, symbol: Symbol) -> None:
-        trade_dir: Path = self._output_dir / symbol / f"{self._trade_count[symbol]:09d}"
-        trade_dir.mkdir(parents=True, exist_ok=True)
-
-        with open(trade_dir / "fills.pkl", "wb") as f:
-            for fill in self._current_roundtrip_fills.pop(symbol):
-                pickle.dump(fill, f)
-        with open(trade_dir / "readings.pkl", "wb") as f:
-            for reading in self._current_roundtrip_readings.pop(symbol):
-                pickle.dump(reading, f)
 
 
 # ——————————————————————————————————————————————————————————————————————————————————————

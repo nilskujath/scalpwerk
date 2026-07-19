@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-charts = ["matplotlib>=3.7"]
+dashboard = ["matplotlib>=3.7"]
 
 [tool.poetry]
 packages = [{include = "scalpwerk", from = "src"}]
